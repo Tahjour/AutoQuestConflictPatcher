@@ -333,7 +333,7 @@ public sealed class QuestMergeEngine
             "VirtualMachineAdapter.Scripts" => $"Script:{GetPropertyValue(item, "Name")}",
             "VirtualMachineAdapter.Scripts.Properties" => $"Property:{GetPropertyValue(item, "Name")}",
             "VirtualMachineAdapter.Scripts.Properties.Objects" => $"ScriptObject:{GetScriptObjectKey(item)}",
-            "VirtualMachineAdapter.Aliases" => $"FragmentAlias:{GetPropertyValue(GetPropertyValue(item, "Property"), "Name")}",
+            "VirtualMachineAdapter.Aliases" => $"QuestAliasVm:{QuestFingerprint.Exact(GetPropertyValue(item, "Object"))}",
             "VirtualMachineAdapter.Aliases.Scripts" => $"Script:{GetPropertyValue(item, "Name")}",
             "VirtualMachineAdapter.Aliases.Scripts.Properties" => $"Property:{GetPropertyValue(item, "Name")}",
             "VirtualMachineAdapter.Aliases.Scripts.Properties.Objects" => $"ScriptObject:{GetScriptObjectKey(item)}",
