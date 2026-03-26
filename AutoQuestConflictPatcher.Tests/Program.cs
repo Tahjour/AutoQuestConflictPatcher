@@ -20,6 +20,8 @@ public static class Program
             ("HPU keeps highest unique non-leaf ancestor value", HpuKeepsHighestUniqueNonLeafAncestorValue),
             ("Alias merge preserves unique flags and dedupes keywords", AliasMergePreservesUniqueFlagsAndDedupesKeywords),
             ("Alias conditions merge per condition and dedupe duplicates", AliasConditionsMergePerConditionAndDedupeDuplicates),
+            ("Empty alias keyword lists stay absent", EmptyAliasKeywordListsStayAbsent),
+            ("VMAD property buckets collapse duplicate property names", VmadPropertyBucketsCollapseDuplicatePropertyNames),
             ("VMAD property type conflict falls back to whole-property HPU", VmadPropertyTypeConflictFallsBackToWholePropertyHpu),
             ("No-op merge matches winning quest", NoOpMergeMatchesWinningQuest),
         };
@@ -127,6 +129,55 @@ public static class Program
         AssertEqual(1, alias.Conditions!.Count, "Expected duplicate conditions to collapse to one entry.");
         var condition = (ConditionFloat)alias.Conditions!.Single();
         AssertEqual(CompareOperator.GreaterThan, condition.CompareOperator, "Expected per-condition HPU to preserve the highest unique variant.");
+    }
+
+    private static void EmptyAliasKeywordListsStayAbsent()
+    {
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                quest.Aliases!.Add(new QuestAlias
+                {
+                    ID = 1,
+                    Name = "Alias1",
+                });
+            }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.Aliases!.Add(new QuestAlias
+                {
+                    ID = 1,
+                    Name = "Alias1",
+                });
+            }));
+
+        var merged = Merge(conflict);
+        var alias = merged.Aliases!.Single();
+        AssertTrue(alias.Keywords is null, "Expected empty keyword lists to stay absent instead of materializing an empty field.");
+    }
+
+    private static void VmadPropertyBucketsCollapseDuplicatePropertyNames()
+    {
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                var script = NewScript("ScriptA");
+                script.Properties!.Add(new ScriptStringProperty { Name = "PropA", Data = "First" });
+                script.Properties!.Add(new ScriptStringProperty { Name = "PropA", Data = "Second" });
+                quest.VirtualMachineAdapter!.Scripts!.Add(script);
+            }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                var script = NewScript("ScriptA");
+                script.Properties!.Add(new ScriptStringProperty { Name = "PropA", Data = "Patch" });
+                quest.VirtualMachineAdapter!.Scripts!.Add(script);
+            }));
+
+        var merged = Merge(conflict);
+        var properties = merged.VirtualMachineAdapter!.Scripts!.Single().Properties!;
+        AssertEqual(1, properties.Count, "Expected duplicate VMAD property names to collapse into a single merged property.");
     }
 
     private static void VmadPropertyTypeConflictFallsBackToWholePropertyHpu()
