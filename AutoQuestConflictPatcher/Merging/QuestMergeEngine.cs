@@ -84,7 +84,12 @@ public sealed class QuestMergeEngine
             return;
         }
 
-        AssignPropertyValue(target, property, DeepCopyHelper.CloneForAssignment(selection.Value, property.PropertyType));
+        if (!AssignPropertyValue(target, property, DeepCopyHelper.CloneForAssignment(selection.Value, property.PropertyType)))
+        {
+            _report.Log($"Skipped incompatible leaf assignment for {propertyPath}: {selection.Value?.GetType().FullName ?? "<null>"} -> {property.PropertyType.FullName ?? property.PropertyType.Name}.");
+            return;
+        }
+
         if (selection.SelectedFrom != conflict.WinningContext.ModKey)
         {
             _report.Log($"HPU selected {propertyPath} from {selection.SelectedFrom}.");
@@ -114,7 +119,11 @@ public sealed class QuestMergeEngine
             }
 
             childTarget = DeepCopyHelper.DeepCopyObject(seed);
-            AssignPropertyValue(target, property, childTarget);
+            if (!AssignPropertyValue(target, property, childTarget))
+            {
+                _report.Log($"Skipped incompatible complex assignment for {propertyPath}: {childTarget.GetType().FullName} -> {property.PropertyType.FullName ?? property.PropertyType.Name}.");
+                return;
+            }
         }
 
         MergeObject(childTarget, sources, propertyPath, conflict);
@@ -533,12 +542,23 @@ public sealed class QuestMergeEngine
         }
     }
 
-    private static void AssignPropertyValue(object target, PropertyInfo property, object? value)
+    private static bool AssignPropertyValue(object target, PropertyInfo property, object? value)
     {
         if (value is not null)
         {
-            property.SetValue(target, value);
-            return;
+            if (property.PropertyType.IsInstanceOfType(value))
+            {
+                property.SetValue(target, value);
+                return true;
+            }
+
+            if (TryCoerceAssignmentValue(value, property.PropertyType, out var coerced))
+            {
+                property.SetValue(target, coerced);
+                return true;
+            }
+
+            return false;
         }
 
         var current = property.GetValue(target);
@@ -549,11 +569,132 @@ public sealed class QuestMergeEngine
             if (clearMethod is not null)
             {
                 clearMethod.Invoke(current, null);
-                return;
+                return true;
             }
         }
 
         property.SetValue(target, null);
+        return true;
+    }
+
+    private static bool TryCoerceAssignmentValue(object value, Type targetType, out object? coerced)
+    {
+        coerced = null;
+
+        var nullableTarget = Nullable.GetUnderlyingType(targetType);
+        var effectiveTarget = nullableTarget ?? targetType;
+        if (effectiveTarget.IsInstanceOfType(value))
+        {
+            coerced = value;
+            return true;
+        }
+
+        if (effectiveTarget.FullName?.Contains("MemorySlice", StringComparison.Ordinal) == true
+            && TryCoerceMemorySlice(value, effectiveTarget, out var memorySlice))
+        {
+            coerced = memorySlice;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryCoerceMemorySlice(object value, Type targetType, out object? coerced)
+    {
+        coerced = null;
+
+        var valueType = value.GetType();
+        foreach (var candidate in GetMemorySliceCandidateInputs(value))
+        {
+            if (candidate is null)
+            {
+                continue;
+            }
+
+            var candidateType = candidate.GetType();
+
+            var ctor = targetType.GetConstructor([candidateType]);
+            if (ctor is not null)
+            {
+                coerced = ctor.Invoke([candidate]);
+                return true;
+            }
+
+            var converter = targetType
+                .GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .FirstOrDefault(method =>
+                {
+                    if (method.Name is not "op_Implicit" and not "op_Explicit")
+                    {
+                        return false;
+                    }
+
+                    if (method.ReturnType != targetType)
+                    {
+                        return false;
+                    }
+
+                    var parameters = method.GetParameters();
+                    return parameters.Length == 1 && parameters[0].ParameterType.IsAssignableFrom(candidateType);
+                });
+
+            if (converter is not null)
+            {
+                coerced = converter.Invoke(null, [candidate]);
+                return true;
+            }
+        }
+
+        var valueConverters = valueType
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Where(method => method.Name is "op_Implicit" or "op_Explicit");
+
+        foreach (var converter in valueConverters)
+        {
+            if (!targetType.IsAssignableFrom(converter.ReturnType))
+            {
+                continue;
+            }
+
+            var parameters = converter.GetParameters();
+            if (parameters.Length != 1 || !parameters[0].ParameterType.IsAssignableFrom(valueType))
+            {
+                continue;
+            }
+
+            coerced = converter.Invoke(null, [value]);
+            return true;
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<object?> GetMemorySliceCandidateInputs(object value)
+    {
+        yield return value;
+
+        if (value is IEnumerable<byte> bytes)
+        {
+            var array = bytes as byte[] ?? bytes.ToArray();
+            yield return array;
+            yield return new Memory<byte>(array);
+            yield return new ReadOnlyMemory<byte>(array);
+        }
+
+        foreach (var methodName in new[] { "ToArray", "AsMemory" })
+        {
+            var method = value.GetType().GetMethod(methodName, BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+            if (method is null)
+            {
+                continue;
+            }
+
+            var candidate = method.Invoke(value, null);
+            if (candidate is not null)
+            {
+                yield return candidate;
+            }
+        }
     }
 
     private sealed record CompiledSource(MergeSource Source, IReadOnlyList<ListEntry> Entries);
