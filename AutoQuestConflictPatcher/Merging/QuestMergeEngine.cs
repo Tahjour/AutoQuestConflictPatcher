@@ -251,11 +251,9 @@ public sealed class QuestMergeEngine
             return [];
         }
 
-        var uniqueBuckets = UsesStableUniqueBucket(propertyPath);
         var entries = new List<ListEntry>();
         var exactSeen = new HashSet<string>(StringComparer.Ordinal);
         var bucketCounts = new Dictionary<string, int>(StringComparer.Ordinal);
-        var bucketIndices = new Dictionary<string, int>(StringComparer.Ordinal);
         var index = 0;
 
         foreach (var item in enumerable)
@@ -274,39 +272,15 @@ public sealed class QuestMergeEngine
             }
 
             var bucketBase = GetBucketBaseKey(item, propertyPath);
-            if (uniqueBuckets)
-            {
-                var entry = new ListEntry(
-                    source.Context,
-                    item,
-                    bucketBase,
-                    exactKey,
-                    index);
+            bucketCounts.TryGetValue(bucketBase, out var occurrence);
+            bucketCounts[bucketBase] = occurrence + 1;
 
-                if (bucketIndices.TryGetValue(bucketBase, out var existingIndex))
-                {
-                    var existing = entries[existingIndex];
-                    entries[existingIndex] = entry with { Index = existing.Index };
-                }
-                else
-                {
-                    bucketIndices[bucketBase] = entries.Count;
-                    entries.Add(entry);
-                }
-            }
-            else
-            {
-                bucketCounts.TryGetValue(bucketBase, out var occurrence);
-                bucketCounts[bucketBase] = occurrence + 1;
-
-                entries.Add(new ListEntry(
-                    source.Context,
-                    item,
-                    $"{bucketBase}#{occurrence}",
-                    exactKey,
-                    index));
-            }
-
+            entries.Add(new ListEntry(
+                source.Context,
+                item,
+                $"{bucketBase}#{occurrence}",
+                exactKey,
+                index));
             index++;
         }
 
@@ -550,12 +524,6 @@ public sealed class QuestMergeEngine
 
     private static void ReplaceListContents(object target, PropertyInfo property, IReadOnlyList<object> items)
     {
-        if (items.Count == 0)
-        {
-            AssignPropertyValue(target, property, null);
-            return;
-        }
-
         var list = property.GetValue(target) ?? System.Activator.CreateInstance(property.PropertyType)
             ?? throw new InvalidOperationException($"Unable to create list for {property.Name}.");
 
@@ -607,30 +575,6 @@ public sealed class QuestMergeEngine
 
         property.SetValue(target, null);
         return true;
-    }
-
-    private static bool UsesStableUniqueBucket(string propertyPath)
-    {
-        return propertyPath switch
-        {
-            "TextDisplayGlobals" => true,
-            "Aliases" => true,
-            "Aliases.Keywords" => true,
-            "Aliases.Factions" => true,
-            "Aliases.Spells" => true,
-            "Aliases.PackageData" => true,
-            "Stages" => true,
-            "Objectives" => true,
-            "VirtualMachineAdapter.Scripts" => true,
-            "VirtualMachineAdapter.Scripts.Properties" => true,
-            "VirtualMachineAdapter.Scripts.Properties.Objects" => true,
-            "VirtualMachineAdapter.Aliases" => true,
-            "VirtualMachineAdapter.Aliases.Scripts" => true,
-            "VirtualMachineAdapter.Aliases.Scripts.Properties" => true,
-            "VirtualMachineAdapter.Aliases.Scripts.Properties.Objects" => true,
-            "VirtualMachineAdapter.Fragments" => true,
-            _ => false,
-        };
     }
 
     private static bool TryCoerceAssignmentValue(object value, Type targetType, out object? coerced)
