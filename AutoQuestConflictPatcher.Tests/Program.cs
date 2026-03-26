@@ -21,7 +21,11 @@ public static class Program
             ("Alias merge preserves unique flags and dedupes keywords", AliasMergePreservesUniqueFlagsAndDedupesKeywords),
             ("Alias conditions merge per condition and dedupe duplicates", AliasConditionsMergePerConditionAndDedupeDuplicates),
             ("Empty alias keyword lists stay absent", EmptyAliasKeywordListsStayAbsent),
+            ("Stage log entries preserve deliberate exact duplicates", StageLogEntriesPreserveDeliberateExactDuplicates),
+            ("Condition removals beat sibling ITM retention", ConditionRemovalsBeatSiblingItmRetention),
+            ("Condition add remove readd keeps reintroduced value", ConditionAddRemoveReaddKeepsReintroducedValue),
             ("VMAD property buckets collapse duplicate property names", VmadPropertyBucketsCollapseDuplicatePropertyNames),
+            ("VMAD property canonical collapse removes logical duplicates", VmadPropertyCanonicalCollapseRemovesLogicalDuplicates),
             ("VMAD alias buckets preserve distinct alias bindings", VmadAliasBucketsPreserveDistinctAliasBindings),
             ("VMAD property type conflict falls back to whole-property HPU", VmadPropertyTypeConflictFallsBackToWholePropertyHpu),
             ("No-op merge matches winning quest", NoOpMergeMatchesWinningQuest),
@@ -157,6 +161,64 @@ public static class Program
         AssertTrue(alias.Keywords is null, "Expected empty keyword lists to stay absent instead of materializing an empty field.");
     }
 
+    private static void StageLogEntriesPreserveDeliberateExactDuplicates()
+    {
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                quest.Stages!.Add(NewStageWithDuplicateLogEntries(10));
+            }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.Stages!.Add(NewStageWithDuplicateLogEntries(10));
+            }));
+
+        var merged = Merge(conflict);
+        var logEntries = merged.Stages!.Single().LogEntries!;
+        AssertEqual(2, logEntries.Count, "Expected deliberate duplicate stage log entries to survive merging.");
+    }
+
+    private static void ConditionRemovalsBeatSiblingItmRetention()
+    {
+        var retainedCondition = NewCondition(1.0f, CompareOperator.EqualTo);
+
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                quest.DialogConditions!.Add(retainedCondition);
+            }),
+            Spec("RemoveBranch.esp", new[] { "Master.esm" }, quest => { }),
+            Spec("KeepSibling.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.DialogConditions!.Add(retainedCondition.DeepCopy());
+            }));
+
+        var merged = Merge(conflict);
+        AssertEqual(0, merged.DialogConditions!.Count, "Expected a deliberate condition removal to beat sibling ITM retention.");
+    }
+
+    private static void ConditionAddRemoveReaddKeepsReintroducedValue()
+    {
+        var addedCondition = NewCondition(2.0f, CompareOperator.GreaterThan);
+
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest => { }),
+            Spec("AddBranch.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.DialogConditions!.Add(addedCondition);
+            }),
+            Spec("RemoveBranch.esp", new[] { "Master.esm", "AddBranch.esp" }, quest => { }),
+            Spec("ReaddSibling.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.DialogConditions!.Add(addedCondition.DeepCopy());
+            }));
+
+        var merged = Merge(conflict);
+        AssertEqual(1, merged.DialogConditions!.Count, "Expected a reintroduced condition to survive after an intermediate removal.");
+        var condition = (ConditionFloat)merged.DialogConditions!.Single();
+        AssertEqual(CompareOperator.GreaterThan, condition.CompareOperator, "Expected the reintroduced condition variant to win.");
+    }
+
     private static void VmadPropertyBucketsCollapseDuplicatePropertyNames()
     {
         var conflict = BuildConflict(
@@ -179,6 +241,30 @@ public static class Program
         var merged = Merge(conflict);
         var properties = merged.VirtualMachineAdapter!.Scripts!.Single().Properties!;
         AssertEqual(1, properties.Count, "Expected duplicate VMAD property names to collapse into a single merged property.");
+    }
+
+    private static void VmadPropertyCanonicalCollapseRemovesLogicalDuplicates()
+    {
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                var script = NewScript("ScriptA");
+                script.Properties!.Add(new ScriptObjectProperty { Name = "Alias_banditA", Object = Link<IQuestGetter>("123456:Master.esm"), Alias = 5 });
+                script.Properties!.Add(new ScriptObjectProperty { Name = "Alias_banditA ", Object = Link<IQuestGetter>("123456:Master.esm"), Alias = 5 });
+                quest.VirtualMachineAdapter!.Scripts!.Add(script);
+            }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                var script = NewScript("ScriptA");
+                script.Properties!.Add(new ScriptObjectProperty { Name = "Alias_banditA", Object = Link<IQuestGetter>("123456:Master.esm"), Alias = 5 });
+                quest.VirtualMachineAdapter!.Scripts!.Add(script);
+            }));
+
+        var merged = Merge(conflict);
+        var properties = merged.VirtualMachineAdapter!.Scripts!.Single().Properties!;
+        AssertEqual(1, properties.Count, "Expected logically identical VMAD properties to collapse to one final property.");
     }
 
     private static void VmadAliasBucketsPreserveDistinctAliasBindings()
@@ -352,6 +438,25 @@ public static class Program
             CompareOperator = compareOperator,
             ComparisonValue = value,
             Data = new GetDeadConditionData(),
+        };
+    }
+
+    private static QuestStage NewStageWithDuplicateLogEntries(ushort index)
+    {
+        var logEntry = new QuestLogEntry
+        {
+            Entry = "Duplicate",
+            Conditions = [NewCondition(10.0f, CompareOperator.NotEqualTo)],
+        };
+
+        return new QuestStage
+        {
+            Index = index,
+            LogEntries =
+            [
+                logEntry,
+                logEntry.DeepCopy(),
+            ],
         };
     }
 

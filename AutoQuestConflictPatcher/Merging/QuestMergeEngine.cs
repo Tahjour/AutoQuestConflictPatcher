@@ -149,8 +149,7 @@ public sealed class QuestMergeEngine
             .ToArray();
 
         var winnerEntries = compiled[^1].Entries;
-        var leafEntries = compiled
-            .Where(source => conflict.LeafMods.Contains(source.Source.Context.ModKey))
+        var allEntries = compiled
             .SelectMany(source => source.Entries)
             .OrderBy(entry => entry.Context.LoadOrderIndex)
             .ThenBy(entry => entry.Index)
@@ -167,7 +166,7 @@ public sealed class QuestMergeEngine
             }
         }
 
-        foreach (var entry in leafEntries)
+        foreach (var entry in allEntries)
         {
             if (seenKeys.Add(entry.BucketKey))
             {
@@ -175,7 +174,10 @@ public sealed class QuestMergeEngine
             }
         }
 
-        var emittedExact = new HashSet<string>(StringComparer.Ordinal);
+        var dedupeExact = ShouldDedupeExactEntries(propertyPath);
+        var emittedExact = dedupeExact
+            ? new HashSet<string>(StringComparer.Ordinal)
+            : null;
         var merged = new List<object>();
 
         foreach (var bucketKey in orderedKeys)
@@ -190,14 +192,14 @@ public sealed class QuestMergeEngine
                 })
                 .ToArray();
 
-            if (!HasLeafValue(bucketSources, conflict.LeafMods))
+            if (!ShouldKeepBucket(bucketSources, conflict, propertyPath))
             {
                 continue;
             }
 
             var mergedEntry = MergeBucket(bucketSources, propertyPath, conflict);
             var exactKey = QuestFingerprint.Exact(mergedEntry);
-            if (!emittedExact.Add(exactKey))
+            if (dedupeExact && emittedExact is not null && !emittedExact.Add(exactKey))
             {
                 _report.Log($"Deduped duplicate entry at {conflict.DisplayName}::{propertyPath}.");
                 continue;
@@ -206,7 +208,7 @@ public sealed class QuestMergeEngine
             merged.Add(mergedEntry);
         }
 
-        return merged;
+        return CollapseStableMergedDuplicates(merged, propertyPath, conflict);
     }
 
     private object MergeBucket(
@@ -252,8 +254,11 @@ public sealed class QuestMergeEngine
         }
 
         var uniqueBuckets = UsesStableUniqueBucket(propertyPath);
+        var dedupeExact = ShouldDedupeExactEntries(propertyPath);
         var entries = new List<ListEntry>();
-        var exactSeen = new HashSet<string>(StringComparer.Ordinal);
+        var exactSeen = dedupeExact
+            ? new HashSet<string>(StringComparer.Ordinal)
+            : null;
         var bucketCounts = new Dictionary<string, int>(StringComparer.Ordinal);
         var bucketIndices = new Dictionary<string, int>(StringComparer.Ordinal);
         var index = 0;
@@ -267,7 +272,7 @@ public sealed class QuestMergeEngine
             }
 
             var exactKey = QuestFingerprint.Exact(item);
-            if (!exactSeen.Add(exactKey))
+            if (dedupeExact && exactSeen is not null && !exactSeen.Add(exactKey))
             {
                 index++;
                 continue;
@@ -313,6 +318,35 @@ public sealed class QuestMergeEngine
         return entries;
     }
 
+    private IReadOnlyList<object> CollapseStableMergedDuplicates(
+        IReadOnlyList<object> merged,
+        string propertyPath,
+        QuestConflict conflict)
+    {
+        if (!UsesStableUniqueBucket(propertyPath) || merged.Count <= 1)
+        {
+            return merged;
+        }
+
+        var kept = new List<object>();
+        var indices = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var item in merged)
+        {
+            var canonicalKey = GetCanonicalStableKey(item, propertyPath);
+            if (indices.TryGetValue(canonicalKey, out var existingIndex))
+            {
+                kept[existingIndex] = item;
+                _report.Log($"Collapsed duplicate stable-key entry at {conflict.DisplayName}::{propertyPath} ({canonicalKey}).");
+                continue;
+            }
+
+            indices[canonicalKey] = kept.Count;
+            kept.Add(item);
+        }
+
+        return kept;
+    }
+
     private static string GetBucketBaseKey(object item, string propertyPath)
     {
         return propertyPath switch
@@ -339,6 +373,18 @@ public sealed class QuestMergeEngine
             "VirtualMachineAdapter.Aliases.Scripts.Properties.Objects" => $"ScriptObject:{GetScriptObjectKey(item)}",
             "VirtualMachineAdapter.Fragments" => $"Fragment:{GetPropertyValue(item, "Stage")}:{GetPropertyValue(item, "StageIndex")}:{GetPropertyValue(item, "ScriptName")}:{GetPropertyValue(item, "FragmentName")}",
             _ => $"Exact:{QuestFingerprint.Exact(item)}",
+        };
+    }
+
+    private static string GetCanonicalStableKey(object item, string propertyPath)
+    {
+        return propertyPath switch
+        {
+            "VirtualMachineAdapter.Scripts" => $"Script:{GetNormalizedText(GetPropertyValue(item, "Name"))}",
+            "VirtualMachineAdapter.Scripts.Properties" => $"Property:{GetNormalizedText(GetPropertyValue(item, "Name"))}",
+            "VirtualMachineAdapter.Aliases.Scripts" => $"Script:{GetNormalizedText(GetPropertyValue(item, "Name"))}",
+            "VirtualMachineAdapter.Aliases.Scripts.Properties" => $"Property:{GetNormalizedText(GetPropertyValue(item, "Name"))}",
+            _ => GetBucketBaseKey(item, propertyPath),
         };
     }
 
@@ -452,6 +498,32 @@ public sealed class QuestMergeEngine
         return sources.Any(source => source.Exists && source.Value is not null && leafMods.Contains(source.Context.ModKey));
     }
 
+    private static bool ShouldKeepBucket(
+        IReadOnlyList<MergeSource> sources,
+        QuestConflict conflict,
+        string propertyPath)
+    {
+        if (!sources.Any(static source => source.Exists && source.Value is not null))
+        {
+            return false;
+        }
+
+        var presenceSources = sources
+            .Select(source => source.Exists && source.Value is not null
+                ? source
+                : new MergeSource(source.Context, MissingBucketValue, Exists: true))
+            .ToArray();
+
+        var selection = HpuSelector.Select(
+            presenceSources,
+            conflict.LeafMods,
+            static value => ReferenceEquals(value, MissingBucketValue)
+                ? "<missing>"
+                : QuestFingerprint.Exact(value));
+
+        return selection is not null && !ReferenceEquals(selection.Value, MissingBucketValue);
+    }
+
     private static object? GetSeedValue(IReadOnlyList<MergeSource> sources)
     {
         for (var index = sources.Count - 1; index >= 0; index--)
@@ -556,6 +628,11 @@ public sealed class QuestMergeEngine
             : GetScriptObjectKey(property);
     }
 
+    private static string GetNormalizedText(object value)
+    {
+        return Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture)?.Trim() ?? "<null>";
+    }
+
     private static void ReplaceListContents(object target, PropertyInfo property, IReadOnlyList<object> items)
     {
         if (items.Count == 0)
@@ -638,6 +715,15 @@ public sealed class QuestMergeEngine
             "VirtualMachineAdapter.Aliases.Scripts.Properties.Objects" => true,
             "VirtualMachineAdapter.Fragments" => true,
             _ => false,
+        };
+    }
+
+    private static bool ShouldDedupeExactEntries(string propertyPath)
+    {
+        return propertyPath switch
+        {
+            "Stages.LogEntries" => false,
+            _ => true,
         };
     }
 
@@ -769,4 +855,8 @@ public sealed class QuestMergeEngine
         string BucketKey,
         string ExactKey,
         int Index);
+
+    private sealed class MissingBucketMarker;
+
+    private static readonly MissingBucketMarker MissingBucketValue = new();
 }
