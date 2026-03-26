@@ -333,7 +333,7 @@ public sealed class QuestMergeEngine
             "VirtualMachineAdapter.Scripts" => $"Script:{GetPropertyValue(item, "Name")}",
             "VirtualMachineAdapter.Scripts.Properties" => $"Property:{GetPropertyValue(item, "Name")}",
             "VirtualMachineAdapter.Scripts.Properties.Objects" => $"ScriptObject:{GetScriptObjectKey(item)}",
-            "VirtualMachineAdapter.Aliases" => $"QuestAliasVm:{QuestFingerprint.Exact(GetPropertyValue(item, "Object"))}",
+            "VirtualMachineAdapter.Aliases" => $"QuestAliasVm:{GetQuestFragmentAliasKey(item)}",
             "VirtualMachineAdapter.Aliases.Scripts" => $"Script:{GetPropertyValue(item, "Name")}",
             "VirtualMachineAdapter.Aliases.Scripts.Properties" => $"Property:{GetPropertyValue(item, "Name")}",
             "VirtualMachineAdapter.Aliases.Scripts.Properties.Objects" => $"ScriptObject:{GetScriptObjectKey(item)}",
@@ -546,6 +546,14 @@ public sealed class QuestMergeEngine
     private static string GetScriptObjectKey(object item)
     {
         return $"{QuestFingerprint.Exact(GetPropertyValue(item, "Object"))}|{QuestFingerprint.Exact(GetPropertyValue(item, "Alias"))}";
+    }
+
+    private static string GetQuestFragmentAliasKey(object item)
+    {
+        var property = GetPropertyValue(item, "Property");
+        return property is string
+            ? QuestFingerprint.Exact(property)
+            : GetScriptObjectKey(property);
     }
 
     private static void ReplaceListContents(object target, PropertyInfo property, IReadOnlyList<object> items)

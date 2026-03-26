@@ -22,6 +22,7 @@ public static class Program
             ("Alias conditions merge per condition and dedupe duplicates", AliasConditionsMergePerConditionAndDedupeDuplicates),
             ("Empty alias keyword lists stay absent", EmptyAliasKeywordListsStayAbsent),
             ("VMAD property buckets collapse duplicate property names", VmadPropertyBucketsCollapseDuplicatePropertyNames),
+            ("VMAD alias buckets preserve distinct alias bindings", VmadAliasBucketsPreserveDistinctAliasBindings),
             ("VMAD property type conflict falls back to whole-property HPU", VmadPropertyTypeConflictFallsBackToWholePropertyHpu),
             ("No-op merge matches winning quest", NoOpMergeMatchesWinningQuest),
         };
@@ -180,6 +181,29 @@ public static class Program
         AssertEqual(1, properties.Count, "Expected duplicate VMAD property names to collapse into a single merged property.");
     }
 
+    private static void VmadAliasBucketsPreserveDistinctAliasBindings()
+    {
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Aliases!.Add(NewQuestFragmentAlias("CartRiderOne", 10));
+                quest.VirtualMachineAdapter!.Aliases!.Add(NewQuestFragmentAlias("CartRiderPlayer", 13));
+            }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Aliases!.Add(NewQuestFragmentAlias("CartRiderOne", 10));
+                quest.VirtualMachineAdapter!.Aliases!.Add(NewQuestFragmentAlias("CartRiderPlayer", 13));
+            }));
+
+        var merged = Merge(conflict);
+        var aliases = merged.VirtualMachineAdapter!.Aliases!;
+        AssertEqual(2, aliases.Count, "Expected distinct VMAD alias bindings to survive list bucketing instead of collapsing together.");
+        AssertEqual((short)10, aliases[0].Property!.Alias, "Expected the first VMAD alias binding to remain intact.");
+        AssertEqual((short)13, aliases[1].Property!.Alias, "Expected the second VMAD alias binding to remain intact.");
+    }
+
     private static void VmadPropertyTypeConflictFallsBackToWholePropertyHpu()
     {
         var conflict = BuildConflict(
@@ -297,6 +321,27 @@ public static class Program
         {
             Name = name,
             Properties = [],
+        };
+    }
+
+    private static QuestFragmentAlias NewQuestFragmentAlias(string name, short alias)
+    {
+        return new QuestFragmentAlias
+        {
+            Property = new ScriptObjectProperty
+            {
+                Name = name,
+                Object = Link<IQuestGetter>("123456:Master.esm"),
+                Alias = alias,
+            },
+            Scripts =
+            [
+                new ScriptEntry
+                {
+                    Name = "CartRiderScript",
+                    Properties = [],
+                },
+            ],
         };
     }
 
