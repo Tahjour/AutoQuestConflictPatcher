@@ -17,6 +17,7 @@ public static class Program
         var tests = new (string Name, Action Body)[]
         {
             ("HPU keeps highest unique leaf value", HpuKeepsHighestUniqueLeafValue),
+            ("HPU keeps highest unique non-leaf ancestor value", HpuKeepsHighestUniqueNonLeafAncestorValue),
             ("Alias merge preserves unique flags and dedupes keywords", AliasMergePreservesUniqueFlagsAndDedupesKeywords),
             ("Alias conditions merge per condition and dedupe duplicates", AliasConditionsMergePerConditionAndDedupeDuplicates),
             ("VMAD property type conflict falls back to whole-property HPU", VmadPropertyTypeConflictFallsBackToWholePropertyHpu),
@@ -51,6 +52,17 @@ public static class Program
 
         var merged = Merge(conflict);
         AssertEqual((byte)50, merged.Priority, "Expected HPU to keep the highest unique leaf value.");
+    }
+
+    private static void HpuKeepsHighestUniqueNonLeafAncestorValue()
+    {
+        var conflict = BuildConflict(
+            Spec("Skyrim.esm", Array.Empty<string>(), quest => { quest.Priority = 10; }),
+            Spec("USSEP.esp", new[] { "Skyrim.esm" }, quest => { quest.Priority = 50; }),
+            Spec("LatePatch.esp", new[] { "Skyrim.esm", "USSEP.esp" }, quest => { quest.Priority = 10; }));
+
+        var merged = Merge(conflict);
+        AssertEqual((byte)50, merged.Priority, "Expected HPU to preserve the highest unique introduced value even when it comes from a non-leaf ancestor.");
     }
 
     private static void AliasMergePreservesUniqueFlagsAndDedupesKeywords()
