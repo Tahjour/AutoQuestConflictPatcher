@@ -84,7 +84,7 @@ public sealed class QuestMergeEngine
             return;
         }
 
-        property.SetValue(target, DeepCopyHelper.CloneForAssignment(selection.Value, property.PropertyType));
+        AssignPropertyValue(target, property, DeepCopyHelper.CloneForAssignment(selection.Value, property.PropertyType));
         if (selection.SelectedFrom != conflict.WinningContext.ModKey)
         {
             _report.Log($"HPU selected {propertyPath} from {selection.SelectedFrom}.");
@@ -100,7 +100,7 @@ public sealed class QuestMergeEngine
     {
         if (!HasLeafValue(sources, conflict.LeafMods))
         {
-            property.SetValue(target, null);
+            AssignPropertyValue(target, property, null);
             return;
         }
 
@@ -114,7 +114,7 @@ public sealed class QuestMergeEngine
             }
 
             childTarget = DeepCopyHelper.DeepCopyObject(seed);
-            property.SetValue(target, childTarget);
+            AssignPropertyValue(target, property, childTarget);
         }
 
         MergeObject(childTarget, sources, propertyPath, conflict);
@@ -531,6 +531,29 @@ public sealed class QuestMergeEngine
         {
             addMethod.Invoke(list, [item]);
         }
+    }
+
+    private static void AssignPropertyValue(object target, PropertyInfo property, object? value)
+    {
+        if (value is not null)
+        {
+            property.SetValue(target, value);
+            return;
+        }
+
+        var current = property.GetValue(target);
+        if (current is not null)
+        {
+            var clearMethod = current.GetType().GetMethod("Clear", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null)
+                ?? property.PropertyType.GetMethod("Clear", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+            if (clearMethod is not null)
+            {
+                clearMethod.Invoke(current, null);
+                return;
+            }
+        }
+
+        property.SetValue(target, null);
     }
 
     private sealed record CompiledSource(MergeSource Source, IReadOnlyList<ListEntry> Entries);
