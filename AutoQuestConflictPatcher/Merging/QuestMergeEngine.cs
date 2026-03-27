@@ -105,7 +105,7 @@ public sealed class QuestMergeEngine
         string propertyPath,
         QuestConflict conflict)
     {
-        var presenceSelection = SelectPresenceHpu(sources, conflict.LeafMods);
+        var presenceSelection = SelectObjectPresenceHpu(sources, conflict.LeafMods);
         if (presenceSelection is null || ReferenceEquals(presenceSelection.Value, MissingBucketValue))
         {
             AssignPropertyValue(target, property, null);
@@ -152,10 +152,41 @@ public sealed class QuestMergeEngine
         string propertyPath,
         QuestConflict conflict)
     {
+        var uniqueBuckets = UsesStableUniqueBucket(propertyPath);
         var compiled = sources
             .Select(source => new CompiledSource(source, BuildListEntries(source, propertyPath)))
             .ToArray();
+        var buckets = uniqueBuckets
+            ? BuildStableOrderedBuckets(compiled, propertyPath, conflict)
+            : BuildSequentialBuckets(compiled, propertyPath, conflict);
 
+        var dedupeExact = ShouldDedupeExactEntries(propertyPath);
+        var emittedExact = dedupeExact
+            ? new HashSet<string>(StringComparer.Ordinal)
+            : null;
+        var merged = new List<object>();
+
+        foreach (var bucket in buckets)
+        {
+            var mergedEntry = MergeBucket(bucket.Sources, propertyPath, conflict);
+            var exactKey = QuestFingerprint.Exact(mergedEntry);
+            if (dedupeExact && emittedExact is not null && !emittedExact.Add(exactKey))
+            {
+                _report.Log($"Deduped duplicate entry at {conflict.DisplayName}::{propertyPath}.");
+                continue;
+            }
+
+            merged.Add(mergedEntry);
+        }
+
+        return CollapseStableMergedDuplicates(merged, propertyPath, conflict);
+    }
+
+    private IReadOnlyList<BucketMergePlan> BuildSequentialBuckets(
+        IReadOnlyList<CompiledSource> compiled,
+        string propertyPath,
+        QuestConflict conflict)
+    {
         var winnerEntries = compiled[^1].Entries;
         var allEntries = compiled
             .SelectMany(source => source.Entries)
@@ -182,41 +213,141 @@ public sealed class QuestMergeEngine
             }
         }
 
-        var dedupeExact = ShouldDedupeExactEntries(propertyPath);
-        var emittedExact = dedupeExact
-            ? new HashSet<string>(StringComparer.Ordinal)
-            : null;
-        var merged = new List<object>();
-
+        var buckets = new List<BucketMergePlan>();
         foreach (var bucketKey in orderedKeys)
         {
-            var bucketSources = compiled
-                .Select(source =>
-                {
-                    var entry = source.Entries.FirstOrDefault(candidate => candidate.BucketKey == bucketKey);
-                    return entry is null
-                        ? new MergeSource(source.Source.Context, null, Exists: false)
-                        : new MergeSource(source.Source.Context, entry.Item, Exists: true);
-                })
-                .ToArray();
-
+            var bucketSources = ProjectBucketSources(compiled, bucketKey);
             if (!ShouldKeepBucket(bucketSources, conflict, propertyPath))
             {
                 continue;
             }
 
-            var mergedEntry = MergeBucket(bucketSources, propertyPath, conflict);
-            var exactKey = QuestFingerprint.Exact(mergedEntry);
-            if (dedupeExact && emittedExact is not null && !emittedExact.Add(exactKey))
+            buckets.Add(new BucketMergePlan(bucketKey, bucketSources));
+        }
+
+        return buckets;
+    }
+
+    private IReadOnlyList<BucketMergePlan> BuildStableOrderedBuckets(
+        IReadOnlyList<CompiledSource> compiled,
+        string propertyPath,
+        QuestConflict conflict)
+    {
+        var winnerEntries = compiled[^1].Entries;
+        var allEntries = compiled
+            .SelectMany(source => source.Entries)
+            .OrderBy(entry => entry.Context.LoadOrderIndex)
+            .ThenBy(entry => entry.Index)
+            .ToArray();
+
+        var winnerIndices = winnerEntries
+            .Select((entry, index) => new { entry.BucketKey, Index = index })
+            .ToDictionary(static entry => entry.BucketKey, static entry => entry.Index, StringComparer.Ordinal);
+
+        var bucketPlans = new List<StableBucketPlan>();
+        foreach (var bucketKey in allEntries.Select(static entry => entry.BucketKey).Distinct(StringComparer.Ordinal))
+        {
+            var bucketSources = ProjectBucketSources(compiled, bucketKey);
+            if (!ShouldKeepBucket(bucketSources, conflict, propertyPath))
             {
-                _report.Log($"Deduped duplicate entry at {conflict.DisplayName}::{propertyPath}.");
                 continue;
             }
 
-            merged.Add(mergedEntry);
+            var preferredIndexSelection = SelectPreferredBucketIndex(compiled, bucketKey, conflict)
+                ?? throw new InvalidOperationException($"Unable to select preferred slot for {propertyPath}::{bucketKey}.");
+
+            var firstSeenEntry = allEntries.First(entry => entry.BucketKey == bucketKey);
+            winnerIndices.TryGetValue(bucketKey, out var winnerIndex);
+            var preferredSourceIndex = compiled
+                .Select(static source => source.Source.Context)
+                .First(context => context.ModKey == preferredIndexSelection.SelectedFrom)
+                .LoadOrderIndex;
+
+            bucketPlans.Add(new StableBucketPlan(
+                bucketKey,
+                bucketSources,
+                Convert.ToInt32(preferredIndexSelection.Value, System.Globalization.CultureInfo.InvariantCulture),
+                winnerIndices.ContainsKey(bucketKey) ? winnerIndex : null,
+                preferredSourceIndex,
+                firstSeenEntry.Context.LoadOrderIndex,
+                firstSeenEntry.Index));
         }
 
-        return CollapseStableMergedDuplicates(merged, propertyPath, conflict);
+        bucketPlans.Sort(static (left, right) =>
+        {
+            var comparison = left.PreferredIndex.CompareTo(right.PreferredIndex);
+            if (comparison != 0)
+            {
+                return comparison;
+            }
+
+            if (left.WinnerIndex.HasValue && right.WinnerIndex.HasValue)
+            {
+                comparison = left.WinnerIndex.Value.CompareTo(right.WinnerIndex.Value);
+                if (comparison != 0)
+                {
+                    return comparison;
+                }
+            }
+
+            comparison = right.PreferredSourceLoadOrderIndex.CompareTo(left.PreferredSourceLoadOrderIndex);
+            if (comparison != 0)
+            {
+                return comparison;
+            }
+
+            comparison = left.FirstSeenLoadOrderIndex.CompareTo(right.FirstSeenLoadOrderIndex);
+            if (comparison != 0)
+            {
+                return comparison;
+            }
+
+            comparison = left.FirstSeenIndex.CompareTo(right.FirstSeenIndex);
+            if (comparison != 0)
+            {
+                return comparison;
+            }
+
+            return StringComparer.Ordinal.Compare(left.BucketKey, right.BucketKey);
+        });
+
+        return bucketPlans;
+    }
+
+    private static IReadOnlyList<MergeSource> ProjectBucketSources(
+        IReadOnlyList<CompiledSource> compiled,
+        string bucketKey)
+    {
+        return compiled
+            .Select(source =>
+            {
+                var entry = source.Entries.FirstOrDefault(candidate => candidate.BucketKey == bucketKey);
+                return entry is null
+                    ? new MergeSource(source.Source.Context, null, Exists: false)
+                    : new MergeSource(source.Source.Context, entry.Item, Exists: true);
+            })
+            .ToArray();
+    }
+
+    private static HpuSelection? SelectPreferredBucketIndex(
+        IReadOnlyList<CompiledSource> compiled,
+        string bucketKey,
+        QuestConflict conflict)
+    {
+        var indexSources = compiled
+            .Select(source =>
+            {
+                var entry = source.Entries.FirstOrDefault(candidate => candidate.BucketKey == bucketKey);
+                return entry is null
+                    ? new MergeSource(source.Source.Context, null, Exists: false)
+                    : new MergeSource(source.Source.Context, entry.Index, Exists: true);
+            })
+            .ToArray();
+
+        return HpuSelector.Select(
+            indexSources,
+            conflict.LeafMods,
+            static value => Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? "<null>");
     }
 
     private object MergeBucket(
@@ -511,11 +642,51 @@ public sealed class QuestMergeEngine
         QuestConflict conflict,
         string propertyPath)
     {
-        var selection = SelectPresenceHpu(sources, conflict.LeafMods);
+        var selection = SelectBucketPresenceHpu(sources, conflict.LeafMods);
         return selection is not null && !ReferenceEquals(selection.Value, MissingBucketValue);
     }
 
-    private static HpuSelection? SelectPresenceHpu(
+    private static HpuSelection? SelectBucketPresenceHpu(
+        IReadOnlyList<MergeSource> sources,
+        IReadOnlySet<ModKey> leafMods)
+    {
+        _ = leafMods;
+
+        if (sources.Count == 0)
+        {
+            return null;
+        }
+
+        HpuSelection? selection = null;
+        for (var index = 0; index < sources.Count; index++)
+        {
+            var source = sources[index];
+            var value = source.Exists && source.Value is not null
+                ? source.Value
+                : MissingBucketValue;
+            var isPresent = !ReferenceEquals(value, MissingBucketValue);
+            var parentIndex = GetNearestParentSourceIndex(sources, index);
+
+            if (parentIndex < 0)
+            {
+                selection = new HpuSelection(value, source.Context.ModKey, index, isPresent ? "<present>" : "<missing>");
+                continue;
+            }
+
+            var parent = sources[parentIndex];
+            var parentIsPresent = parent.Exists && parent.Value is not null;
+            if (parentIsPresent == isPresent)
+            {
+                continue;
+            }
+
+            selection = new HpuSelection(value, source.Context.ModKey, index, isPresent ? "<present>" : "<missing>");
+        }
+
+        return selection;
+    }
+
+    private static HpuSelection? SelectObjectPresenceHpu(
         IReadOnlyList<MergeSource> sources,
         IReadOnlySet<ModKey> leafMods)
     {
@@ -536,6 +707,20 @@ public sealed class QuestMergeEngine
             static value => ReferenceEquals(value, MissingBucketValue)
                 ? "<missing>"
                 : QuestFingerprint.Exact(value));
+    }
+
+    private static int GetNearestParentSourceIndex(IReadOnlyList<MergeSource> sources, int sourceIndex)
+    {
+        var source = sources[sourceIndex];
+        for (var index = sourceIndex - 1; index >= 0; index--)
+        {
+            if (source.Context.Masters.Contains(sources[index].Context.ModKey))
+            {
+                return index;
+            }
+        }
+
+        return -1;
     }
 
     private static object? GetSeedValue(IReadOnlyList<MergeSource> sources)
@@ -585,6 +770,18 @@ public sealed class QuestMergeEngine
         }
 
         return false;
+    }
+
+    private static bool IsValidQuestFragmentAlias(QuestFragmentAlias alias)
+    {
+        return alias.Property is not null && IsValidQuestFragmentAliasProperty(alias.Property);
+    }
+
+    private static bool IsValidQuestFragmentAliasProperty(ScriptObjectProperty property)
+    {
+        return property.Alias >= 0
+            && !string.IsNullOrWhiteSpace(property.Name)
+            && property.Object.FormKey != default;
     }
 
     private static bool ShouldSkipProperty(string path, string propertyName)
@@ -665,10 +862,10 @@ public sealed class QuestMergeEngine
         for (var index = adapter.Aliases.Count - 1; index >= 0; index--)
         {
             var alias = adapter.Aliases[index];
-            if (alias.Property is null)
+            if (!IsValidQuestFragmentAlias(alias))
             {
                 adapter.Aliases.RemoveAt(index);
-                _report.Log($"Removed invalid VMAD alias with null property from {conflict.DisplayName}.");
+                _report.Log($"Removed invalid VMAD alias with incomplete property payload from {conflict.DisplayName}.");
                 continue;
             }
 
@@ -703,9 +900,9 @@ public sealed class QuestMergeEngine
         for (var index = 0; index < adapter.Aliases.Count; index++)
         {
             var alias = adapter.Aliases[index];
-            if (alias.Property is null)
+            if (!IsValidQuestFragmentAlias(alias))
             {
-                throw new InvalidOperationException($"Invalid VMAD alias property on {conflict.DisplayName} at alias index {index}.");
+                throw new InvalidOperationException($"Invalid VMAD alias property payload on {conflict.DisplayName} at alias index {index}.");
             }
 
             if (alias.Scripts is null)
@@ -971,6 +1168,20 @@ public sealed class QuestMergeEngine
     }
 
     private sealed record CompiledSource(MergeSource Source, IReadOnlyList<ListEntry> Entries);
+
+    private record BucketMergePlan(
+        string BucketKey,
+        IReadOnlyList<MergeSource> Sources);
+
+    private sealed record StableBucketPlan(
+        string BucketKey,
+        IReadOnlyList<MergeSource> Sources,
+        int PreferredIndex,
+        int? WinnerIndex,
+        int PreferredSourceLoadOrderIndex,
+        int FirstSeenLoadOrderIndex,
+        int FirstSeenIndex)
+        : BucketMergePlan(BucketKey, Sources);
 
     private sealed record ListEntry(
         QuestSourceContext Context,

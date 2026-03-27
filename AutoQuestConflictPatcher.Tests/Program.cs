@@ -21,6 +21,10 @@ public static class Program
             ("Alias merge preserves unique flags and dedupes keywords", AliasMergePreservesUniqueFlagsAndDedupesKeywords),
             ("Alias conditions merge per condition and dedupe duplicates", AliasConditionsMergePerConditionAndDedupeDuplicates),
             ("Empty alias keyword lists stay absent", EmptyAliasKeywordListsStayAbsent),
+            ("Alias package data keeps HPU insertion slot when winner omits alias", AliasPackageDataKeepsHpuInsertionSlotWhenWinnerOmitsAlias),
+            ("Aliases keep HPU slot when later winner omits bucket", AliasesKeepHpuSlotWhenLaterWinnerOmitsBucket),
+            ("Later ITM slot occurrence does not undo earlier unique slot", LaterItmSlotOccurrenceDoesNotUndoEarlierUniqueSlot),
+            ("Remove and readd keeps reintroduced slot order", RemoveAndReaddKeepsReintroducedSlotOrder),
             ("Stage log entries preserve deliberate exact duplicates", StageLogEntriesPreserveDeliberateExactDuplicates),
             ("Condition removals beat sibling ITM retention", ConditionRemovalsBeatSiblingItmRetention),
             ("Condition add remove readd keeps reintroduced value", ConditionAddRemoveReaddKeepsReintroducedValue),
@@ -162,6 +166,142 @@ public static class Program
         var merged = Merge(conflict);
         var alias = merged.Aliases!.Single();
         AssertTrue(alias.Keywords is null, "Expected empty keyword lists to stay absent instead of materializing an empty field.");
+    }
+
+    private static void AliasPackageDataKeepsHpuInsertionSlotWhenWinnerOmitsAlias()
+    {
+        var basePackage = Link<IPackageGetter>("000100:Master.esm");
+        var insertedA = Link<IPackageGetter>("000101:PatchA.esp");
+        var insertedB = Link<IPackageGetter>("000102:PatchA.esp");
+
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                var alias = NewAlias(18);
+                alias.PackageData!.Add(basePackage);
+                quest.Aliases!.Add(alias);
+            }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest =>
+            {
+                var alias = NewAlias(18);
+                alias.PackageData!.Add(insertedA);
+                alias.PackageData!.Add(insertedB);
+                alias.PackageData!.Add(basePackage);
+                quest.Aliases!.Add(alias);
+            }),
+            Spec("Winner.esp", new[] { "Master.esm" }, quest =>
+            {
+                var alias = NewAlias(18);
+                alias.PackageData!.Add(basePackage);
+                quest.Aliases!.Add(alias);
+            }));
+
+        var merged = Merge(conflict);
+        var alias = merged.Aliases!.Single(candidate => candidate.ID == 18);
+        AssertEqual(3, alias.PackageData!.Count, "Expected merged alias package data to keep all surviving packages.");
+        AssertEqual(insertedA.FormKey, ((IFormLinkGetter)alias.PackageData![0]).FormKey, "Expected the first inserted package to stay at the front of the merged list.");
+        AssertEqual(insertedB.FormKey, ((IFormLinkGetter)alias.PackageData![1]).FormKey, "Expected the second inserted package to stay ahead of the inherited package.");
+        AssertEqual(basePackage.FormKey, ((IFormLinkGetter)alias.PackageData![2]).FormKey, "Expected the inherited package to keep the later HPU slot instead of being appended first.");
+    }
+
+    private static void AliasesKeepHpuSlotWhenLaterWinnerOmitsBucket()
+    {
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                quest.Aliases!.Add(NewAlias(1));
+                quest.Aliases!.Add(NewAlias(2));
+                quest.Aliases!.Add(NewAlias(3));
+            }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.Aliases!.Add(NewAlias(1));
+                quest.Aliases!.Add(NewAlias(17));
+                quest.Aliases!.Add(NewAlias(2));
+                quest.Aliases!.Add(NewAlias(3));
+            }),
+            Spec("Winner.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.Aliases!.Add(NewAlias(1));
+                quest.Aliases!.Add(NewAlias(2));
+                quest.Aliases!.Add(NewAlias(3));
+                quest.Priority = 25;
+            }));
+
+        var merged = Merge(conflict);
+        AssertSequenceEqual(new uint[] { 1, 17, 2, 3 }, merged.Aliases!.Select(alias => alias.ID).ToArray(), "Expected the added alias to stay in its HPU-selected slot instead of moving to the end.");
+    }
+
+    private static void LaterItmSlotOccurrenceDoesNotUndoEarlierUniqueSlot()
+    {
+        var basePackage = Link<IPackageGetter>("000110:Master.esm");
+        var inserted = Link<IPackageGetter>("000111:PatchA.esp");
+
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                var alias = NewAlias(18);
+                alias.PackageData!.Add(basePackage);
+                quest.Aliases!.Add(alias);
+            }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest =>
+            {
+                var alias = NewAlias(18);
+                alias.PackageData!.Add(inserted);
+                alias.PackageData!.Add(basePackage);
+                quest.Aliases!.Add(alias);
+            }),
+            Spec("PatchB.esp", new[] { "Master.esm", "PatchA.esp" }, quest =>
+            {
+                var alias = NewAlias(18);
+                alias.PackageData!.Add(inserted);
+                alias.PackageData!.Add(basePackage);
+                quest.Aliases!.Add(alias);
+            }));
+
+        var merged = Merge(conflict);
+        var alias = merged.Aliases!.Single();
+        AssertEqual(inserted.FormKey, ((IFormLinkGetter)alias.PackageData![0]).FormKey, "Expected the repeated ITM slot occurrence to preserve the earlier unique insertion order.");
+        AssertEqual(basePackage.FormKey, ((IFormLinkGetter)alias.PackageData![1]).FormKey, "Expected the inherited package to keep the moved slot after an ITM repeat.");
+    }
+
+    private static void RemoveAndReaddKeepsReintroducedSlotOrder()
+    {
+        var basePackage = Link<IPackageGetter>("000120:Master.esm");
+        var inserted = Link<IPackageGetter>("000121:PatchA.esp");
+
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                var alias = NewAlias(18);
+                alias.PackageData!.Add(basePackage);
+                quest.Aliases!.Add(alias);
+            }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest =>
+            {
+                var alias = NewAlias(18);
+                alias.PackageData!.Add(inserted);
+                alias.PackageData!.Add(basePackage);
+                quest.Aliases!.Add(alias);
+            }),
+            Spec("PatchB.esp", new[] { "Master.esm", "PatchA.esp" }, quest =>
+            {
+                var alias = NewAlias(18);
+                alias.PackageData!.Add(inserted);
+                quest.Aliases!.Add(alias);
+            }),
+            Spec("PatchC.esp", new[] { "Master.esm", "PatchA.esp", "PatchB.esp" }, quest =>
+            {
+                var alias = NewAlias(18);
+                alias.PackageData!.Add(inserted);
+                alias.PackageData!.Add(basePackage);
+                quest.Aliases!.Add(alias);
+            }));
+
+        var merged = Merge(conflict);
+        var alias = merged.Aliases!.Single();
+        AssertEqual(inserted.FormKey, ((IFormLinkGetter)alias.PackageData![0]).FormKey, "Expected the surviving inserted package to remain in the reintroduced slot.");
+        AssertEqual(basePackage.FormKey, ((IFormLinkGetter)alias.PackageData![1]).FormKey, "Expected the reintroduced package to keep the later slot chosen by HPU.");
     }
 
     private static void StageLogEntriesPreserveDeliberateExactDuplicates()
@@ -586,6 +726,14 @@ public static class Program
         if (!condition)
         {
             throw new InvalidOperationException(message);
+        }
+    }
+
+    private static void AssertSequenceEqual<T>(IReadOnlyList<T> expected, IReadOnlyList<T> actual, string message)
+    {
+        if (expected.Count != actual.Count || !expected.SequenceEqual(actual))
+        {
+            throw new InvalidOperationException($"{message} Expected: [{string.Join(", ", expected)}]. Actual: [{string.Join(", ", actual)}].");
         }
     }
 
