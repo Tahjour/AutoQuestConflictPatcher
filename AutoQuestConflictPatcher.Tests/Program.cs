@@ -27,6 +27,7 @@ public static class Program
             ("VMAD property buckets collapse duplicate property names", VmadPropertyBucketsCollapseDuplicatePropertyNames),
             ("VMAD property canonical collapse removes logical duplicates", VmadPropertyCanonicalCollapseRemovesLogicalDuplicates),
             ("VMAD alias buckets preserve distinct alias bindings", VmadAliasBucketsPreserveDistinctAliasBindings),
+            ("VMAD alias property stays valid when ancestor bucket wins", VmadAliasPropertyStaysValidWhenAncestorBucketWins),
             ("VMAD property type conflict falls back to whole-property HPU", VmadPropertyTypeConflictFallsBackToWholePropertyHpu),
             ("No-op merge matches winning quest", NoOpMergeMatchesWinningQuest),
         };
@@ -288,6 +289,30 @@ public static class Program
         AssertEqual(2, aliases.Count, "Expected distinct VMAD alias bindings to survive list bucketing instead of collapsing together.");
         AssertEqual((short)10, aliases[0].Property!.Alias, "Expected the first VMAD alias binding to remain intact.");
         AssertEqual((short)13, aliases[1].Property!.Alias, "Expected the second VMAD alias binding to remain intact.");
+    }
+
+    private static void VmadAliasPropertyStaysValidWhenAncestorBucketWins()
+    {
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest => { }),
+            Spec("AddAncestor.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Aliases!.Add(NewQuestFragmentAlias("CartRiderOne", 10));
+            }),
+            Spec("LeafDescendant.esp", new[] { "Master.esm", "AddAncestor.esp" }, quest =>
+            {
+                quest.Priority = 25;
+            }),
+            Spec("Sibling.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.Priority = 50;
+            }));
+
+        var merged = Merge(conflict);
+        var alias = merged.VirtualMachineAdapter!.Aliases!.Single();
+        AssertTrue(alias.Property is not null, "Expected the surviving VMAD alias bucket to keep a non-null property payload.");
+        AssertEqual((short)10, alias.Property!.Alias, "Expected the surviving VMAD alias property payload to remain intact.");
     }
 
     private static void VmadPropertyTypeConflictFallsBackToWholePropertyHpu()

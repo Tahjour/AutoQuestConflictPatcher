@@ -103,7 +103,8 @@ public sealed class QuestMergeEngine
         string propertyPath,
         QuestConflict conflict)
     {
-        if (!HasLeafValue(sources, conflict.LeafMods))
+        var presenceSelection = SelectPresenceHpu(sources, conflict.LeafMods);
+        if (presenceSelection is null || ReferenceEquals(presenceSelection.Value, MissingBucketValue))
         {
             AssignPropertyValue(target, property, null);
             return;
@@ -112,7 +113,7 @@ public sealed class QuestMergeEngine
         object? childTarget = property.GetValue(target);
         if (childTarget is null)
         {
-            var seed = GetSeedValue(sources);
+            var seed = presenceSelection.Value;
             if (seed is null)
             {
                 return;
@@ -124,6 +125,11 @@ public sealed class QuestMergeEngine
                 _report.Log($"Skipped incompatible complex assignment for {propertyPath}: {childTarget.GetType().FullName} -> {property.PropertyType.FullName ?? property.PropertyType.Name}.");
                 return;
             }
+        }
+
+        if (!HasLeafValue(sources, conflict.LeafMods))
+        {
+            return;
         }
 
         MergeObject(childTarget, sources, propertyPath, conflict);
@@ -503,9 +509,17 @@ public sealed class QuestMergeEngine
         QuestConflict conflict,
         string propertyPath)
     {
-        if (!sources.Any(static source => source.Exists && source.Value is not null))
+        var selection = SelectPresenceHpu(sources, conflict.LeafMods);
+        return selection is not null && !ReferenceEquals(selection.Value, MissingBucketValue);
+    }
+
+    private static HpuSelection? SelectPresenceHpu(
+        IReadOnlyList<MergeSource> sources,
+        IReadOnlySet<ModKey> leafMods)
+    {
+        if (!sources.Any(static source => source.Exists))
         {
-            return false;
+            return null;
         }
 
         var presenceSources = sources
@@ -514,14 +528,12 @@ public sealed class QuestMergeEngine
                 : new MergeSource(source.Context, MissingBucketValue, Exists: true))
             .ToArray();
 
-        var selection = HpuSelector.Select(
+        return HpuSelector.Select(
             presenceSources,
-            conflict.LeafMods,
+            leafMods,
             static value => ReferenceEquals(value, MissingBucketValue)
                 ? "<missing>"
                 : QuestFingerprint.Exact(value));
-
-        return selection is not null && !ReferenceEquals(selection.Value, MissingBucketValue);
     }
 
     private static object? GetSeedValue(IReadOnlyList<MergeSource> sources)
