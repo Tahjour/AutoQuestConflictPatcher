@@ -655,13 +655,13 @@ public sealed class QuestMergeEngine
             return;
         }
 
-        adapter.Scripts ??= [];
+        EnsureListPropertyInitialized(adapter, nameof(QuestAdapter.Scripts));
         foreach (var script in adapter.Scripts)
         {
-            script.Properties ??= [];
+            EnsureListPropertyInitialized(script, nameof(ScriptEntry.Properties));
         }
 
-        adapter.Aliases ??= [];
+        EnsureListPropertyInitialized(adapter, nameof(QuestAdapter.Aliases));
         for (var index = adapter.Aliases.Count - 1; index >= 0; index--)
         {
             var alias = adapter.Aliases[index];
@@ -672,14 +672,14 @@ public sealed class QuestMergeEngine
                 continue;
             }
 
-            alias.Scripts ??= [];
+            EnsureListPropertyInitialized(alias, nameof(QuestFragmentAlias.Scripts));
             foreach (var script in alias.Scripts)
             {
-                script.Properties ??= [];
+                EnsureListPropertyInitialized(script, nameof(ScriptEntry.Properties));
             }
         }
 
-        adapter.Fragments ??= [];
+        EnsureListPropertyInitialized(adapter, nameof(QuestAdapter.Fragments));
     }
 
     private static void ValidateForWrite(Quest quest, QuestConflict conflict)
@@ -720,6 +720,25 @@ public sealed class QuestMergeEngine
                     throw new InvalidOperationException($"Invalid VMAD alias script properties on {conflict.DisplayName} at alias index {index}, script index {scriptIndex}.");
                 }
             }
+        }
+    }
+
+    private static void EnsureListPropertyInitialized(object target, string propertyName)
+    {
+        var property = target.GetType().GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance)
+            ?? throw new InvalidOperationException($"Unable to find property {propertyName} on {target.GetType().FullName}.");
+
+        if (property.GetValue(target) is not null)
+        {
+            return;
+        }
+
+        var list = Activator.CreateInstance(property.PropertyType)
+            ?? throw new InvalidOperationException($"Unable to create list for {target.GetType().FullName}.{propertyName}.");
+
+        if (!AssignPropertyValue(target, property, list))
+        {
+            throw new InvalidOperationException($"Unable to initialize list for {target.GetType().FullName}.{propertyName}.");
         }
     }
 
