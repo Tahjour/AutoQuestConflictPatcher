@@ -27,7 +27,7 @@ public static class Program
         var settings = _settings?.Value ?? new AutoQuestConflictPatcherSettings();
         var report = new MergeReport();
         var scanner = new QuestConflictScanner();
-        var merger = new QuestMergeEngine(report);
+        var merger = new QuestMergeEngine(report, state.DataFolderPath.ToString());
 
         foreach (var conflict in scanner.Scan(state, settings, report))
         {

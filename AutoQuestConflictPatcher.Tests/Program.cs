@@ -16,14 +16,17 @@ public static class Program
     {
         var tests = new (string Name, Action Body)[]
         {
-            ("HPU keeps highest unique leaf value", HpuKeepsHighestUniqueLeafValue),
-            ("HPU keeps highest unique non-leaf ancestor value", HpuKeepsHighestUniqueNonLeafAncestorValue),
+            ("HPMO favors repeated meaningful value over ITM-only occurrences", HpmoFavorsRepeatedMeaningfulValueOverItmOnlyOccurrences),
+            ("HPMO preserves shared ITM across all sources", HpmoPreservesSharedItmAcrossAllSources),
+            ("HPMO ties break toward the highest-priority meaningful value", HpmoTiesBreakTowardHighestPriorityMeaningfulValue),
+            ("HPMO counts non-official restore as meaningful", HpmoCountsNonOfficialRestoreAsMeaningful),
+            ("Official restore does not beat a meaningful change unless shared", OfficialRestoreDoesNotBeatMeaningfulChangeUnlessShared),
             ("Alias merge preserves unique flags and dedupes keywords", AliasMergePreservesUniqueFlagsAndDedupesKeywords),
             ("Alias conditions merge per condition and dedupe duplicates", AliasConditionsMergePerConditionAndDedupeDuplicates),
             ("Empty alias keyword lists stay absent", EmptyAliasKeywordListsStayAbsent),
-            ("Alias package data keeps HPU insertion slot when winner omits alias", AliasPackageDataKeepsHpuInsertionSlotWhenWinnerOmitsAlias),
-            ("Aliases keep HPU slot when later winner omits bucket", AliasesKeepHpuSlotWhenLaterWinnerOmitsBucket),
-            ("Later ITM slot occurrence does not undo earlier unique slot", LaterItmSlotOccurrenceDoesNotUndoEarlierUniqueSlot),
+            ("Alias package data keeps HPMO insertion slot when winner omits alias", AliasPackageDataKeepsHpmoInsertionSlotWhenWinnerOmitsAlias),
+            ("Aliases keep HPMO slot when later winner omits bucket", AliasesKeepHpmoSlotWhenLaterWinnerOmitsBucket),
+            ("Later ITM slot occurrence does not undo earlier meaningful slot", LaterItmSlotOccurrenceDoesNotUndoEarlierMeaningfulSlot),
             ("Remove and readd keeps reintroduced slot order", RemoveAndReaddKeepsReintroducedSlotOrder),
             ("Stage log entries preserve deliberate exact duplicates", StageLogEntriesPreserveDeliberateExactDuplicates),
             ("Condition removals beat sibling ITM retention", ConditionRemovalsBeatSiblingItmRetention),
@@ -31,10 +34,11 @@ public static class Program
             ("VMAD property buckets collapse duplicate property names", VmadPropertyBucketsCollapseDuplicatePropertyNames),
             ("VMAD property canonical collapse removes logical duplicates", VmadPropertyCanonicalCollapseRemovesLogicalDuplicates),
             ("VMAD alias buckets preserve distinct alias bindings", VmadAliasBucketsPreserveDistinctAliasBindings),
+            ("VMAD alias nested subfields survive mixed ITM and unique branches", VmadAliasNestedSubfieldsSurviveMixedItmAndUniqueBranches),
             ("VMAD alias property stays valid when ancestor bucket wins", VmadAliasPropertyStaysValidWhenAncestorBucketWins),
             ("VMAD alias empty script lists stay allocated", VmadAliasEmptyScriptListsStayAllocated),
             ("VMAD sanitizer removes aliases with null property payloads", VmadSanitizerRemovesAliasesWithNullPropertyPayloads),
-            ("VMAD property type conflict falls back to whole-property HPU", VmadPropertyTypeConflictFallsBackToWholePropertyHpu),
+            ("VMAD property type conflict falls back to whole-property HPMO", VmadPropertyTypeConflictFallsBackToWholePropertyHpmo),
             ("No-op merge matches winning quest", NoOpMergeMatchesWinningQuest),
         };
 
@@ -57,26 +61,61 @@ public static class Program
         return failures == 0 ? 0 : 1;
     }
 
-    private static void HpuKeepsHighestUniqueLeafValue()
+    private static void HpmoFavorsRepeatedMeaningfulValueOverItmOnlyOccurrences()
     {
         var conflict = BuildConflict(
             Spec("Master.esm", Array.Empty<string>(), quest => { quest.Priority = 10; }),
             Spec("PatchA.esp", new[] { "Master.esm" }, quest => { quest.Priority = 50; }),
-            Spec("PatchB.esp", new[] { "Master.esm" }, quest => { quest.Priority = 10; }));
+            Spec("PatchB.esp", new[] { "Master.esm", "PatchA.esp" }, quest => { quest.Priority = 50; }));
 
         var merged = Merge(conflict);
-        AssertEqual((byte)50, merged.Priority, "Expected HPU to keep the highest unique leaf value.");
+        AssertEqual((byte)50, merged.Priority, "Expected repeated meaningful support to beat ITM-only occurrences.");
     }
 
-    private static void HpuKeepsHighestUniqueNonLeafAncestorValue()
+    private static void HpmoPreservesSharedItmAcrossAllSources()
     {
         var conflict = BuildConflict(
             Spec("Skyrim.esm", Array.Empty<string>(), quest => { quest.Priority = 10; }),
-            Spec("USSEP.esp", new[] { "Skyrim.esm" }, quest => { quest.Priority = 50; }),
-            Spec("LatePatch.esp", new[] { "Skyrim.esm", "USSEP.esp" }, quest => { quest.Priority = 10; }));
+            Spec("PatchA.esp", new[] { "Skyrim.esm" }, quest => { quest.Priority = 10; }),
+            Spec("PatchB.esp", new[] { "Skyrim.esm", "PatchA.esp" }, quest => { quest.Priority = 10; }));
 
         var merged = Merge(conflict);
-        AssertEqual((byte)50, merged.Priority, "Expected HPU to preserve the highest unique introduced value even when it comes from a non-leaf ancestor.");
+        AssertEqual((byte)10, merged.Priority, "Expected a shared ITM value across all sources to be preserved.");
+    }
+
+    private static void HpmoTiesBreakTowardHighestPriorityMeaningfulValue()
+    {
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest => { quest.Priority = 10; }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest => { quest.Priority = 50; }),
+            Spec("PatchB.esp", new[] { "Master.esm" }, quest => { quest.Priority = 70; }));
+
+        var merged = Merge(conflict);
+        AssertEqual((byte)70, merged.Priority, "Expected equal meaningful counts to break toward the highest-priority meaningful occurrence.");
+    }
+
+    private static void HpmoCountsNonOfficialRestoreAsMeaningful()
+    {
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest => { quest.Priority = 10; }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest => { quest.Priority = 40; }),
+            Spec("PatchB.esp", new[] { "Master.esm" }, quest => { quest.Priority = 70; }),
+            Spec("PatchC.esp", new[] { "Master.esm", "PatchA.esp" }, quest => { quest.Priority = 40; }));
+
+        var merged = Merge(conflict);
+        AssertEqual((byte)40, merged.Priority, "Expected restoring an older non-official mod value over a later conflict to count as meaningful support.");
+    }
+
+    private static void OfficialRestoreDoesNotBeatMeaningfulChangeUnlessShared()
+    {
+        var conflict = BuildConflict(
+            Spec("Skyrim.esm", Array.Empty<string>(), quest => { quest.Priority = 10; }),
+            Spec("PatchA.esp", new[] { "Skyrim.esm" }, quest => { quest.Priority = 40; }),
+            Spec("PatchB.esp", new[] { "Skyrim.esm" }, quest => { quest.Priority = 70; }),
+            Spec("PatchC.esp", new[] { "Skyrim.esm" }, quest => { quest.Priority = 10; }));
+
+        var merged = Merge(conflict);
+        AssertEqual((byte)70, merged.Priority, "Expected an official-master restore to lose to a competing meaningful change unless every source keeps the official value.");
     }
 
     private static void AliasMergePreservesUniqueFlagsAndDedupesKeywords()
@@ -106,7 +145,7 @@ public static class Program
 
         var merged = Merge(conflict);
         var alias = merged.Aliases!.Single();
-        AssertEqual(QuestAlias.Flag.StoresText, alias.Flags, "Expected alias flags to keep the unique HPU value.");
+        AssertEqual(QuestAlias.Flag.StoresText, alias.Flags, "Expected alias flags to keep the HPMO-selected unique value.");
         AssertEqual(2, alias.Keywords!.Count, "Expected merged alias keywords to dedupe duplicates.");
     }
 
@@ -140,7 +179,7 @@ public static class Program
         var alias = merged.Aliases!.Single();
         AssertEqual(1, alias.Conditions!.Count, "Expected duplicate conditions to collapse to one entry.");
         var condition = (ConditionFloat)alias.Conditions!.Single();
-        AssertEqual(CompareOperator.GreaterThan, condition.CompareOperator, "Expected per-condition HPU to preserve the highest unique variant.");
+        AssertEqual(CompareOperator.GreaterThan, condition.CompareOperator, "Expected per-condition HPMO to preserve the strongest supported variant.");
     }
 
     private static void EmptyAliasKeywordListsStayAbsent()
@@ -168,7 +207,7 @@ public static class Program
         AssertTrue(alias.Keywords is null, "Expected empty keyword lists to stay absent instead of materializing an empty field.");
     }
 
-    private static void AliasPackageDataKeepsHpuInsertionSlotWhenWinnerOmitsAlias()
+    private static void AliasPackageDataKeepsHpmoInsertionSlotWhenWinnerOmitsAlias()
     {
         var basePackage = Link<IPackageGetter>("000100:Master.esm");
         var insertedA = Link<IPackageGetter>("000101:PatchA.esp");
@@ -201,10 +240,10 @@ public static class Program
         AssertEqual(3, alias.PackageData!.Count, "Expected merged alias package data to keep all surviving packages.");
         AssertEqual(insertedA.FormKey, ((IFormLinkGetter)alias.PackageData![0]).FormKey, "Expected the first inserted package to stay at the front of the merged list.");
         AssertEqual(insertedB.FormKey, ((IFormLinkGetter)alias.PackageData![1]).FormKey, "Expected the second inserted package to stay ahead of the inherited package.");
-        AssertEqual(basePackage.FormKey, ((IFormLinkGetter)alias.PackageData![2]).FormKey, "Expected the inherited package to keep the later HPU slot instead of being appended first.");
+        AssertEqual(basePackage.FormKey, ((IFormLinkGetter)alias.PackageData![2]).FormKey, "Expected the inherited package to keep the later HPMO slot instead of being appended first.");
     }
 
-    private static void AliasesKeepHpuSlotWhenLaterWinnerOmitsBucket()
+    private static void AliasesKeepHpmoSlotWhenLaterWinnerOmitsBucket()
     {
         var conflict = BuildConflict(
             Spec("Master.esm", Array.Empty<string>(), quest =>
@@ -229,10 +268,10 @@ public static class Program
             }));
 
         var merged = Merge(conflict);
-        AssertSequenceEqual(new uint[] { 1, 17, 2, 3 }, merged.Aliases!.Select(alias => alias.ID).ToArray(), "Expected the added alias to stay in its HPU-selected slot instead of moving to the end.");
+        AssertSequenceEqual(new uint[] { 1, 17, 2, 3 }, merged.Aliases!.Select(alias => alias.ID).ToArray(), "Expected the added alias to stay in its HPMO-selected slot instead of moving to the end.");
     }
 
-    private static void LaterItmSlotOccurrenceDoesNotUndoEarlierUniqueSlot()
+    private static void LaterItmSlotOccurrenceDoesNotUndoEarlierMeaningfulSlot()
     {
         var basePackage = Link<IPackageGetter>("000110:Master.esm");
         var inserted = Link<IPackageGetter>("000111:PatchA.esp");
@@ -301,7 +340,7 @@ public static class Program
         var merged = Merge(conflict);
         var alias = merged.Aliases!.Single();
         AssertEqual(inserted.FormKey, ((IFormLinkGetter)alias.PackageData![0]).FormKey, "Expected the surviving inserted package to remain in the reintroduced slot.");
-        AssertEqual(basePackage.FormKey, ((IFormLinkGetter)alias.PackageData![1]).FormKey, "Expected the reintroduced package to keep the later slot chosen by HPU.");
+        AssertEqual(basePackage.FormKey, ((IFormLinkGetter)alias.PackageData![1]).FormKey, "Expected the reintroduced package to keep the later slot chosen by HPMO.");
     }
 
     private static void StageLogEntriesPreserveDeliberateExactDuplicates()
@@ -433,6 +472,40 @@ public static class Program
         AssertEqual((short)13, aliases[1].Property!.Alias, "Expected the second VMAD alias binding to remain intact.");
     }
 
+    private static void VmadAliasNestedSubfieldsSurviveMixedItmAndUniqueBranches()
+    {
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Aliases!.Add(NewQuestFragmentAlias("CartRiderOne", 10));
+            }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                var alias = NewQuestFragmentAlias("CartRiderOne", 10);
+                alias.Scripts!.Single().Properties!.Add(new ScriptIntProperty
+                {
+                    Name = "StageToSetOnDeath",
+                    Data = 52,
+                });
+                quest.VirtualMachineAdapter!.Aliases!.Add(alias);
+            }),
+            Spec("PatchB.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Aliases!.Add(NewQuestFragmentAlias("CartRiderOne", 10));
+            }));
+
+        var merged = Merge(conflict);
+        var alias = merged.VirtualMachineAdapter!.Aliases!.Single();
+        AssertTrue(alias.Property is not null, "Expected the VMAD alias property payload to survive mixed ITM and unique branches.");
+        AssertEqual((short)10, alias.Property!.Alias, "Expected the VMAD alias binding to remain intact.");
+        AssertEqual(1, alias.Scripts!.Count, "Expected the VMAD alias script list to stay present.");
+        AssertEqual(1, alias.Scripts![0].Properties!.Count, "Expected nested VMAD alias script properties to be forwarded instead of skipped.");
+        AssertEqual("StageToSetOnDeath", alias.Scripts![0].Properties![0].Name, "Expected the nested VMAD alias property name to survive.");
+    }
+
     private static void VmadAliasPropertyStaysValidWhenAncestorBucketWins()
     {
         var conflict = BuildConflict(
@@ -519,7 +592,7 @@ public static class Program
         AssertEqual(0, merged.VirtualMachineAdapter!.Aliases!.Count, "Expected invalid VMAD aliases with null property payloads to be removed before write.");
     }
 
-    private static void VmadPropertyTypeConflictFallsBackToWholePropertyHpu()
+    private static void VmadPropertyTypeConflictFallsBackToWholePropertyHpmo()
     {
         var conflict = BuildConflict(
             Spec("Master.esm", Array.Empty<string>(), quest =>
@@ -546,7 +619,7 @@ public static class Program
 
         var merged = Merge(conflict);
         var property = merged.VirtualMachineAdapter!.Scripts!.Single().Properties!.Single();
-        AssertTrue(property is ScriptIntProperty, "Expected a whole-property HPU fallback to keep the higher-priority type variant.");
+        AssertTrue(property is ScriptIntProperty, "Expected a whole-property HPMO fallback to keep the higher-priority type variant.");
         AssertEqual(42, ((ScriptIntProperty)property).Data, "Expected the higher-priority property value to win.");
     }
 

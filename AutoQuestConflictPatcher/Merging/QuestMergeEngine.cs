@@ -13,10 +13,12 @@ namespace AutoQuestConflictPatcher.Merging;
 public sealed class QuestMergeEngine
 {
     private readonly MergeReport _report;
+    private readonly OfficialMasterClassifier _officialMasters;
 
-    public QuestMergeEngine(MergeReport report)
+    public QuestMergeEngine(MergeReport report, string? dataFolderPath = null)
     {
         _report = report;
+        _officialMasters = new OfficialMasterClassifier(dataFolderPath);
     }
 
     public Quest Merge(QuestConflict conflict)
@@ -80,7 +82,7 @@ public sealed class QuestMergeEngine
             return;
         }
 
-        var selection = HpuSelector.Select(sources, conflict.LeafMods);
+        var selection = HpmoSelector.Select(sources, _officialMasters);
         if (selection is null)
         {
             return;
@@ -94,7 +96,7 @@ public sealed class QuestMergeEngine
 
         if (selection.SelectedFrom != conflict.WinningContext.ModKey)
         {
-            _report.Log($"HPU selected {propertyPath} from {selection.SelectedFrom}.");
+            _report.Log($"HPMO selected {propertyPath} from {selection.SelectedFrom}.");
         }
     }
 
@@ -105,7 +107,7 @@ public sealed class QuestMergeEngine
         string propertyPath,
         QuestConflict conflict)
     {
-        var presenceSelection = SelectObjectPresenceHpu(sources, conflict.LeafMods);
+        var presenceSelection = SelectObjectPresenceHpmo(sources);
         if (presenceSelection is null || ReferenceEquals(presenceSelection.Value, MissingBucketValue))
         {
             AssignPropertyValue(target, property, null);
@@ -127,11 +129,6 @@ public sealed class QuestMergeEngine
                 _report.Log($"Skipped incompatible complex assignment for {propertyPath}: {childTarget.GetType().FullName} -> {property.PropertyType.FullName ?? property.PropertyType.Name}.");
                 return;
             }
-        }
-
-        if (!HasLeafValue(sources, conflict.LeafMods))
-        {
-            return;
         }
 
         MergeObject(childTarget, sources, propertyPath, conflict);
@@ -253,14 +250,14 @@ public sealed class QuestMergeEngine
                 continue;
             }
 
-            var preferredIndexSelection = SelectPreferredBucketIndex(compiled, bucketKey, conflict)
+            var preferredIndexSelection = SelectPreferredBucketIndex(compiled, bucketKey)
                 ?? throw new InvalidOperationException($"Unable to select preferred slot for {propertyPath}::{bucketKey}.");
 
             var firstSeenEntry = allEntries.First(entry => entry.BucketKey == bucketKey);
             winnerIndices.TryGetValue(bucketKey, out var winnerIndex);
             var preferredSourceIndex = compiled
                 .Select(static source => source.Source.Context)
-                .First(context => context.ModKey == preferredIndexSelection.SelectedFrom)
+                .Single(context => context.ModKey == preferredIndexSelection.SelectedFrom)
                 .LoadOrderIndex;
 
             bucketPlans.Add(new StableBucketPlan(
@@ -329,10 +326,9 @@ public sealed class QuestMergeEngine
             .ToArray();
     }
 
-    private static HpuSelection? SelectPreferredBucketIndex(
+    private HpmoSelection? SelectPreferredBucketIndex(
         IReadOnlyList<CompiledSource> compiled,
-        string bucketKey,
-        QuestConflict conflict)
+        string bucketKey)
     {
         var indexSources = compiled
             .Select(source =>
@@ -344,9 +340,9 @@ public sealed class QuestMergeEngine
             })
             .ToArray();
 
-        return HpuSelector.Select(
+        return HpmoSelector.Select(
             indexSources,
-            conflict.LeafMods,
+            _officialMasters,
             static value => Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? "<null>");
     }
 
@@ -356,24 +352,24 @@ public sealed class QuestMergeEngine
         QuestConflict conflict)
     {
         var leafTypes = sources
-            .Where(source => source.Exists && source.Value is not null && conflict.LeafMods.Contains(source.Context.ModKey))
+            .Where(source => source.Exists && source.Value is not null)
             .Select(source => source.Value!.GetType())
             .Distinct()
             .ToArray();
 
         if (ShouldSelectWholeItem(propertyPath, leafTypes))
         {
-            var selection = HpuSelector.Select(
+            var selection = HpmoSelector.Select(
                 sources,
-                conflict.LeafMods,
+                _officialMasters,
                 QuestFingerprint.Exact);
 
             if (selection?.Value is null)
             {
-                throw new InvalidOperationException($"Unable to select HPU entry for {propertyPath}.");
+                throw new InvalidOperationException($"Unable to select HPMO entry for {propertyPath}.");
             }
 
-            _report.Log($"Selected HPU entry for {propertyPath} from {selection.SelectedFrom}.");
+            _report.Log($"Selected HPMO entry for {propertyPath} from {selection.SelectedFrom}.");
             return DeepCopyHelper.DeepCopyObject(selection.Value);
         }
 
@@ -632,95 +628,55 @@ public sealed class QuestMergeEngine
         return projected;
     }
 
-    private static bool HasLeafValue(IReadOnlyList<MergeSource> sources, IReadOnlySet<ModKey> leafMods)
-    {
-        return sources.Any(source => source.Exists && source.Value is not null && leafMods.Contains(source.Context.ModKey));
-    }
-
-    private static bool ShouldKeepBucket(
+    private bool ShouldKeepBucket(
         IReadOnlyList<MergeSource> sources,
         QuestConflict conflict,
         string propertyPath)
     {
-        var selection = SelectBucketPresenceHpu(sources, conflict.LeafMods);
+        _ = conflict;
+        _ = propertyPath;
+        var selection = SelectBucketPresenceHpmo(sources);
         return selection is not null && !ReferenceEquals(selection.Value, MissingBucketValue);
     }
 
-    private static HpuSelection? SelectBucketPresenceHpu(
-        IReadOnlyList<MergeSource> sources,
-        IReadOnlySet<ModKey> leafMods)
+    private HpmoSelection? SelectBucketPresenceHpmo(IReadOnlyList<MergeSource> sources)
     {
-        _ = leafMods;
-
-        if (sources.Count == 0)
+        if (!sources.Any())
         {
             return null;
         }
 
-        HpuSelection? selection = null;
-        for (var index = 0; index < sources.Count; index++)
-        {
-            var source = sources[index];
-            var value = source.Exists && source.Value is not null
-                ? source.Value
-                : MissingBucketValue;
-            var isPresent = !ReferenceEquals(value, MissingBucketValue);
-            var parentIndex = GetNearestParentSourceIndex(sources, index);
-
-            if (parentIndex < 0)
-            {
-                selection = new HpuSelection(value, source.Context.ModKey, index, isPresent ? "<present>" : "<missing>");
-                continue;
-            }
-
-            var parent = sources[parentIndex];
-            var parentIsPresent = parent.Exists && parent.Value is not null;
-            if (parentIsPresent == isPresent)
-            {
-                continue;
-            }
-
-            selection = new HpuSelection(value, source.Context.ModKey, index, isPresent ? "<present>" : "<missing>");
-        }
-
-        return selection;
+        var presenceSources = BuildPresenceSources(sources);
+        return HpmoSelector.Select(
+            presenceSources,
+            _officialMasters,
+            static value => ReferenceEquals(value, MissingBucketValue)
+                ? "<missing>"
+                : "<present>");
     }
 
-    private static HpuSelection? SelectObjectPresenceHpu(
-        IReadOnlyList<MergeSource> sources,
-        IReadOnlySet<ModKey> leafMods)
+    private HpmoSelection? SelectObjectPresenceHpmo(IReadOnlyList<MergeSource> sources)
     {
         if (!sources.Any(static source => source.Exists))
         {
             return null;
         }
 
-        var presenceSources = sources
-            .Select(source => source.Exists && source.Value is not null
-                ? source
-                : new MergeSource(source.Context, MissingBucketValue, Exists: true))
-            .ToArray();
-
-        return HpuSelector.Select(
-            presenceSources,
-            leafMods,
+        return HpmoSelector.Select(
+            BuildPresenceSources(sources),
+            _officialMasters,
             static value => ReferenceEquals(value, MissingBucketValue)
                 ? "<missing>"
-                : QuestFingerprint.Exact(value));
+                : "<present>");
     }
 
-    private static int GetNearestParentSourceIndex(IReadOnlyList<MergeSource> sources, int sourceIndex)
+    private static IReadOnlyList<MergeSource> BuildPresenceSources(IReadOnlyList<MergeSource> sources)
     {
-        var source = sources[sourceIndex];
-        for (var index = sourceIndex - 1; index >= 0; index--)
-        {
-            if (source.Context.Masters.Contains(sources[index].Context.ModKey))
-            {
-                return index;
-            }
-        }
-
-        return -1;
+        return sources
+            .Select(source => source.Exists && source.Value is not null
+                ? new MergeSource(source.Context, source.Value, Exists: true)
+                : new MergeSource(source.Context, MissingBucketValue, Exists: true))
+            .ToArray();
     }
 
     private static object? GetSeedValue(IReadOnlyList<MergeSource> sources)
