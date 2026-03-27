@@ -733,7 +733,7 @@ public sealed class QuestMergeEngine
             return;
         }
 
-        var list = Activator.CreateInstance(property.PropertyType)
+        var list = System.Activator.CreateInstance(property.PropertyType)
             ?? throw new InvalidOperationException($"Unable to create list for {target.GetType().FullName}.{propertyName}.");
 
         if (!AssignPropertyValue(target, property, list))
