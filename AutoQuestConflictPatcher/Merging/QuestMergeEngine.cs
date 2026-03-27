@@ -142,7 +142,7 @@ public sealed class QuestMergeEngine
         string propertyPath,
         QuestConflict conflict)
     {
-        ReplaceListContents(target, property, MergeListEntries(sources, propertyPath, conflict));
+        ReplaceListContents(target, property, propertyPath, MergeListEntries(sources, propertyPath, conflict));
     }
 
     private IReadOnlyList<object> MergeListEntries(
@@ -645,11 +645,20 @@ public sealed class QuestMergeEngine
         return Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture)?.Trim() ?? "<null>";
     }
 
-    private static void ReplaceListContents(object target, PropertyInfo property, IReadOnlyList<object> items)
+    private static void ReplaceListContents(object target, PropertyInfo property, string propertyPath, IReadOnlyList<object> items)
     {
         if (items.Count == 0)
         {
-            AssignPropertyValue(target, property, null);
+            if (ShouldNullEmptyList(propertyPath))
+            {
+                AssignPropertyValue(target, property, null);
+                return;
+            }
+
+            var emptyList = property.GetValue(target) ?? System.Activator.CreateInstance(property.PropertyType)
+                ?? throw new InvalidOperationException($"Unable to create list for {property.Name}.");
+            property.SetValue(target, emptyList);
+            property.PropertyType.GetMethod("Clear", Type.EmptyTypes)?.Invoke(emptyList, null);
             return;
         }
 
@@ -728,6 +737,11 @@ public sealed class QuestMergeEngine
             "VirtualMachineAdapter.Fragments" => true,
             _ => false,
         };
+    }
+
+    private static bool ShouldNullEmptyList(string propertyPath)
+    {
+        return !propertyPath.StartsWith("VirtualMachineAdapter", StringComparison.Ordinal);
     }
 
     private static bool ShouldDedupeExactEntries(string propertyPath)

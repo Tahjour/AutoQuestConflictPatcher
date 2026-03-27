@@ -28,6 +28,7 @@ public static class Program
             ("VMAD property canonical collapse removes logical duplicates", VmadPropertyCanonicalCollapseRemovesLogicalDuplicates),
             ("VMAD alias buckets preserve distinct alias bindings", VmadAliasBucketsPreserveDistinctAliasBindings),
             ("VMAD alias property stays valid when ancestor bucket wins", VmadAliasPropertyStaysValidWhenAncestorBucketWins),
+            ("VMAD alias empty script lists stay allocated", VmadAliasEmptyScriptListsStayAllocated),
             ("VMAD property type conflict falls back to whole-property HPU", VmadPropertyTypeConflictFallsBackToWholePropertyHpu),
             ("No-op merge matches winning quest", NoOpMergeMatchesWinningQuest),
         };
@@ -313,6 +314,44 @@ public static class Program
         var alias = merged.VirtualMachineAdapter!.Aliases!.Single();
         AssertTrue(alias.Property is not null, "Expected the surviving VMAD alias bucket to keep a non-null property payload.");
         AssertEqual((short)10, alias.Property!.Alias, "Expected the surviving VMAD alias property payload to remain intact.");
+    }
+
+    private static void VmadAliasEmptyScriptListsStayAllocated()
+    {
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Aliases!.Add(new QuestFragmentAlias
+                {
+                    Property = new ScriptObjectProperty
+                    {
+                        Name = "CartRiderOne",
+                        Object = Link<IQuestGetter>("123456:Master.esm"),
+                        Alias = 10,
+                    },
+                    Scripts = [],
+                });
+            }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Aliases!.Add(new QuestFragmentAlias
+                {
+                    Property = new ScriptObjectProperty
+                    {
+                        Name = "CartRiderOne",
+                        Object = Link<IQuestGetter>("123456:Master.esm"),
+                        Alias = 10,
+                    },
+                    Scripts = [],
+                });
+            }));
+
+        var merged = Merge(conflict);
+        var alias = merged.VirtualMachineAdapter!.Aliases!.Single();
+        AssertTrue(alias.Scripts is not null, "Expected VMAD alias script lists to stay allocated even when empty.");
+        AssertEqual(0, alias.Scripts!.Count, "Expected an empty VMAD alias script list to remain empty instead of becoming null.");
     }
 
     private static void VmadPropertyTypeConflictFallsBackToWholePropertyHpu()
