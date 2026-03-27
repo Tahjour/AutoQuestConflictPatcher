@@ -29,6 +29,7 @@ public static class Program
             ("VMAD alias buckets preserve distinct alias bindings", VmadAliasBucketsPreserveDistinctAliasBindings),
             ("VMAD alias property stays valid when ancestor bucket wins", VmadAliasPropertyStaysValidWhenAncestorBucketWins),
             ("VMAD alias empty script lists stay allocated", VmadAliasEmptyScriptListsStayAllocated),
+            ("VMAD sanitizer removes aliases with null property payloads", VmadSanitizerRemovesAliasesWithNullPropertyPayloads),
             ("VMAD property type conflict falls back to whole-property HPU", VmadPropertyTypeConflictFallsBackToWholePropertyHpu),
             ("No-op merge matches winning quest", NoOpMergeMatchesWinningQuest),
         };
@@ -352,6 +353,30 @@ public static class Program
         var alias = merged.VirtualMachineAdapter!.Aliases!.Single();
         AssertTrue(alias.Scripts is not null, "Expected VMAD alias script lists to stay allocated even when empty.");
         AssertEqual(0, alias.Scripts!.Count, "Expected an empty VMAD alias script list to remain empty instead of becoming null.");
+    }
+
+    private static void VmadSanitizerRemovesAliasesWithNullPropertyPayloads()
+    {
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Aliases!.Add(new QuestFragmentAlias
+                {
+                    Scripts = [],
+                });
+            }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Aliases!.Add(new QuestFragmentAlias
+                {
+                    Scripts = [],
+                });
+            }));
+
+        var merged = Merge(conflict);
+        AssertEqual(0, merged.VirtualMachineAdapter!.Aliases!.Count, "Expected invalid VMAD aliases with null property payloads to be removed before write.");
     }
 
     private static void VmadPropertyTypeConflictFallsBackToWholePropertyHpu()

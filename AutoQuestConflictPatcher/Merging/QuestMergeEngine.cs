@@ -28,6 +28,8 @@ public sealed class QuestMergeEngine
 
         _report.Log($"Merging {conflict.DisplayName} from {conflict.ContextsLowToHigh.Count} contexts.");
         MergeObject(merged, sources, string.Empty, conflict);
+        SanitizeForWrite(merged, conflict);
+        ValidateForWrite(merged, conflict);
         return merged;
     }
 
@@ -643,6 +645,82 @@ public sealed class QuestMergeEngine
     private static string GetNormalizedText(object value)
     {
         return Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture)?.Trim() ?? "<null>";
+    }
+
+    private void SanitizeForWrite(Quest quest, QuestConflict conflict)
+    {
+        var adapter = quest.VirtualMachineAdapter;
+        if (adapter is null)
+        {
+            return;
+        }
+
+        adapter.Scripts ??= [];
+        foreach (var script in adapter.Scripts)
+        {
+            script.Properties ??= [];
+        }
+
+        adapter.Aliases ??= [];
+        for (var index = adapter.Aliases.Count - 1; index >= 0; index--)
+        {
+            var alias = adapter.Aliases[index];
+            if (alias.Property is null)
+            {
+                adapter.Aliases.RemoveAt(index);
+                _report.Log($"Removed invalid VMAD alias with null property from {conflict.DisplayName}.");
+                continue;
+            }
+
+            alias.Scripts ??= [];
+            foreach (var script in alias.Scripts)
+            {
+                script.Properties ??= [];
+            }
+        }
+
+        adapter.Fragments ??= [];
+    }
+
+    private static void ValidateForWrite(Quest quest, QuestConflict conflict)
+    {
+        var adapter = quest.VirtualMachineAdapter;
+        if (adapter is null)
+        {
+            return;
+        }
+
+        if (adapter.Scripts is null)
+        {
+            throw new InvalidOperationException($"Invalid VMAD scripts list on {conflict.DisplayName}.");
+        }
+
+        if (adapter.Aliases is null)
+        {
+            throw new InvalidOperationException($"Invalid VMAD aliases list on {conflict.DisplayName}.");
+        }
+
+        for (var index = 0; index < adapter.Aliases.Count; index++)
+        {
+            var alias = adapter.Aliases[index];
+            if (alias.Property is null)
+            {
+                throw new InvalidOperationException($"Invalid VMAD alias property on {conflict.DisplayName} at alias index {index}.");
+            }
+
+            if (alias.Scripts is null)
+            {
+                throw new InvalidOperationException($"Invalid VMAD alias scripts list on {conflict.DisplayName} at alias index {index}.");
+            }
+
+            for (var scriptIndex = 0; scriptIndex < alias.Scripts.Count; scriptIndex++)
+            {
+                if (alias.Scripts[scriptIndex].Properties is null)
+                {
+                    throw new InvalidOperationException($"Invalid VMAD alias script properties on {conflict.DisplayName} at alias index {index}, script index {scriptIndex}.");
+                }
+            }
+        }
     }
 
     private static void ReplaceListContents(object target, PropertyInfo property, string propertyPath, IReadOnlyList<object> items)
