@@ -35,10 +35,12 @@ public static class Program
             ("VMAD property canonical collapse removes logical duplicates", VmadPropertyCanonicalCollapseRemovesLogicalDuplicates),
             ("VMAD alias buckets preserve distinct alias bindings", VmadAliasBucketsPreserveDistinctAliasBindings),
             ("VMAD alias nested subfields survive mixed ITM and unique branches", VmadAliasNestedSubfieldsSurviveMixedItmAndUniqueBranches),
+            ("VMAD alias nested subfields survive unrelated later omissions", VmadAliasNestedSubfieldsSurviveUnrelatedLaterOmissions),
             ("VMAD alias property stays valid when ancestor bucket wins", VmadAliasPropertyStaysValidWhenAncestorBucketWins),
             ("VMAD alias empty script lists stay allocated", VmadAliasEmptyScriptListsStayAllocated),
             ("VMAD sanitizer removes aliases with null property payloads", VmadSanitizerRemovesAliasesWithNullPropertyPayloads),
             ("VMAD property type conflict falls back to whole-property HPMO", VmadPropertyTypeConflictFallsBackToWholePropertyHpmo),
+            ("Stage index metadata survives unrelated later omissions", StageIndexMetadataSurvivesUnrelatedLaterOmissions),
             ("No-op merge matches winning quest", NoOpMergeMatchesWinningQuest),
         };
 
@@ -530,6 +532,35 @@ public static class Program
         AssertEqual((short)10, alias.Property!.Alias, "Expected the surviving VMAD alias property payload to remain intact.");
     }
 
+    private static void VmadAliasNestedSubfieldsSurviveUnrelatedLaterOmissions()
+    {
+        var conflict = BuildConflict(
+            Spec("Skyrim.esm", Array.Empty<string>(), quest => { }),
+            Spec("USSEP.esp", new[] { "Skyrim.esm" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                var alias = NewQuestFragmentAlias("TelravAlias", 4);
+                alias.Scripts!.Single().Name = "defaultaliasondeathscript";
+                alias.Scripts![0].Properties!.Add(new ScriptIntProperty
+                {
+                    Name = "StageToSetOnDeath",
+                    Data = 52,
+                });
+                quest.VirtualMachineAdapter!.Aliases!.Add(alias);
+            }),
+            Spec("PatchA.esp", new[] { "Skyrim.esm" }, quest => { quest.Priority = 50; }),
+            Spec("Winner.esp", new[] { "Skyrim.esm" }, quest => { quest.Priority = 75; }));
+
+        var merged = Merge(conflict);
+        AssertEqual(1, merged.VirtualMachineAdapter!.Aliases!.Count, "Expected the VMAD alias bucket to survive unrelated later omissions.");
+        var alias = merged.VirtualMachineAdapter!.Aliases!.Single();
+        AssertTrue(alias.Property is not null, "Expected the VMAD alias property payload to be retained.");
+        AssertEqual((short)4, alias.Property!.Alias, "Expected the VMAD alias binding to stay intact.");
+        AssertEqual("defaultaliasondeathscript", alias.Scripts!.Single().Name, "Expected the VMAD alias script name to be forwarded.");
+        AssertEqual(1, alias.Scripts![0].Properties!.Count, "Expected the nested VMAD alias script property to survive.");
+        AssertEqual("StageToSetOnDeath", alias.Scripts![0].Properties![0].Name, "Expected the nested VMAD alias property name to be preserved.");
+    }
+
     private static void VmadAliasEmptyScriptListsStayAllocated()
     {
         var conflict = BuildConflict(
@@ -621,6 +652,30 @@ public static class Program
         var property = merged.VirtualMachineAdapter!.Scripts!.Single().Properties!.Single();
         AssertTrue(property is ScriptIntProperty, "Expected a whole-property HPMO fallback to keep the higher-priority type variant.");
         AssertEqual(42, ((ScriptIntProperty)property).Data, "Expected the higher-priority property value to win.");
+    }
+
+    private static void StageIndexMetadataSurvivesUnrelatedLaterOmissions()
+    {
+        var conflict = BuildConflict(
+            Spec("Skyrim.esm", Array.Empty<string>(), quest => { }),
+            Spec("USSEP.esp", new[] { "Skyrim.esm" }, quest =>
+            {
+                quest.Stages!.Add(new QuestStage
+                {
+                    Index = 51,
+                    Flags = QuestStage.Flag.StartUpStage,
+                    Unknown = 95,
+                    LogEntries = [],
+                });
+            }),
+            Spec("PatchA.esp", new[] { "Skyrim.esm" }, quest => { quest.Priority = 50; }),
+            Spec("Winner.esp", new[] { "Skyrim.esm" }, quest => { quest.Priority = 75; }));
+
+        var merged = Merge(conflict);
+        var stage = merged.Stages!.Single();
+        AssertEqual((ushort)51, stage.Index, "Expected the stage index to survive unrelated later omissions.");
+        AssertEqual(QuestStage.Flag.StartUpStage, stage.Flags, "Expected the stage index flags to be forwarded.");
+        AssertEqual((byte)95, stage.Unknown, "Expected the stage index unknown value to be forwarded.");
     }
 
     private static void NoOpMergeMatchesWinningQuest()

@@ -641,12 +641,51 @@ public sealed class QuestMergeEngine
 
     private HpmoSelection? SelectBucketPresenceHpmo(IReadOnlyList<MergeSource> sources)
     {
-        if (!sources.Any())
+        var presenceSources = BuildBucketPresenceSources(sources);
+        if (presenceSources.Count == 0)
         {
             return null;
         }
 
-        var presenceSources = BuildPresenceSources(sources);
+        var originFingerprint = sources.Count > 0 && sources[0].Exists && sources[0].Value is not null
+            ? "<present>"
+            : "<missing>";
+
+        return HpmoSelector.Analyze(
+            presenceSources,
+            _officialMasters,
+            static value => ReferenceEquals(value, MissingBucketValue)
+                ? "<missing>"
+                : "<present>")
+            .OrderByDescending(static group => group.MeaningfulOccurrences)
+            .ThenByDescending(group => GetAdjustedPresenceSupport(group, originFingerprint))
+            .ThenByDescending(group => !StringComparer.Ordinal.Equals(group.Fingerprint, originFingerprint))
+            .ThenByDescending(static group => group.HighestMeaningfulSelection?.SelectedSourceIndex ?? int.MinValue)
+            .ThenByDescending(static group => group.HighestSelection.SelectedSourceIndex)
+            .ThenByDescending(static group => group.FirstSourceIndex)
+            .ThenBy(static group => group.Fingerprint, StringComparer.Ordinal)
+            .Select(static group => group.HighestMeaningfulSelection ?? group.HighestSelection)
+            .FirstOrDefault();
+    }
+
+    private static int GetAdjustedPresenceSupport(HpmoGroup group, string originFingerprint)
+    {
+        if (!StringComparer.Ordinal.Equals(group.Fingerprint, originFingerprint))
+        {
+            return group.TotalOccurrences;
+        }
+
+        return Math.Max(0, group.TotalOccurrences - 1);
+    }
+
+    private HpmoSelection? SelectObjectPresenceHpmo(IReadOnlyList<MergeSource> sources)
+    {
+        var presenceSources = BuildObjectPresenceSources(sources);
+        if (presenceSources.Count == 0)
+        {
+            return null;
+        }
+
         return HpmoSelector.Select(
             presenceSources,
             _officialMasters,
@@ -655,28 +694,64 @@ public sealed class QuestMergeEngine
                 : "<present>");
     }
 
-    private HpmoSelection? SelectObjectPresenceHpmo(IReadOnlyList<MergeSource> sources)
+    private static IReadOnlyList<MergeSource> BuildBucketPresenceSources(IReadOnlyList<MergeSource> sources)
     {
-        if (!sources.Any(static source => source.Exists))
+        var presenceSources = new List<MergeSource>(sources.Count);
+        for (var index = 0; index < sources.Count; index++)
         {
-            return null;
+            var source = sources[index];
+            if (source.Exists && source.Value is not null)
+            {
+                presenceSources.Add(new MergeSource(source.Context, source.Value, Exists: true));
+                continue;
+            }
+
+            if (index == 0)
+            {
+                presenceSources.Add(new MergeSource(source.Context, MissingBucketValue, Exists: true));
+                continue;
+            }
+
+            var parentIndex = GetNearestParentSourceIndex(sources, index);
+            if (parentIndex < 0)
+            {
+                continue;
+            }
+
+            var parent = sources[parentIndex];
+            if (!parent.Exists || parent.Value is null)
+            {
+                continue;
+            }
+
+            presenceSources.Add(new MergeSource(source.Context, MissingBucketValue, Exists: true));
         }
 
-        return HpmoSelector.Select(
-            BuildPresenceSources(sources),
-            _officialMasters,
-            static value => ReferenceEquals(value, MissingBucketValue)
-                ? "<missing>"
-                : "<present>");
+        return presenceSources;
     }
 
-    private static IReadOnlyList<MergeSource> BuildPresenceSources(IReadOnlyList<MergeSource> sources)
+    private static IReadOnlyList<MergeSource> BuildObjectPresenceSources(IReadOnlyList<MergeSource> sources)
     {
         return sources
-            .Select(source => source.Exists && source.Value is not null
+            .Where(static source => source.Exists)
+            .Select(source => source.Value is not null
                 ? new MergeSource(source.Context, source.Value, Exists: true)
                 : new MergeSource(source.Context, MissingBucketValue, Exists: true))
             .ToArray();
+    }
+
+    private static int GetNearestParentSourceIndex(IReadOnlyList<MergeSource> sources, int sourceIndex)
+    {
+        var source = sources[sourceIndex];
+        for (var index = sourceIndex - 1; index >= 0; index--)
+        {
+            if (source.Context.Masters.Contains(sources[index].Context.ModKey))
+            {
+                return index;
+            }
+        }
+
+        return -1;
     }
 
     private static object? GetSeedValue(IReadOnlyList<MergeSource> sources)
