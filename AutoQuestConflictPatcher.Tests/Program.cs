@@ -34,6 +34,7 @@ public static class Program
             ("VMAD property buckets collapse duplicate property names", VmadPropertyBucketsCollapseDuplicatePropertyNames),
             ("VMAD property canonical collapse removes logical duplicates", VmadPropertyCanonicalCollapseRemovesLogicalDuplicates),
             ("VMAD alias buckets preserve distinct alias bindings", VmadAliasBucketsPreserveDistinctAliasBindings),
+            ("VMAD quest fragment aliases survive blank property names", VmadQuestFragmentAliasesSurviveBlankPropertyNames),
             ("VMAD alias nested subfields survive mixed ITM and unique branches", VmadAliasNestedSubfieldsSurviveMixedItmAndUniqueBranches),
             ("VMAD alias nested subfields survive unrelated later omissions", VmadAliasNestedSubfieldsSurviveUnrelatedLaterOmissions),
             ("VMAD alias property stays valid when ancestor bucket wins", VmadAliasPropertyStaysValidWhenAncestorBucketWins),
@@ -41,6 +42,8 @@ public static class Program
             ("VMAD sanitizer removes aliases with null property payloads", VmadSanitizerRemovesAliasesWithNullPropertyPayloads),
             ("VMAD property type conflict falls back to whole-property HPMO", VmadPropertyTypeConflictFallsBackToWholePropertyHpmo),
             ("Stage index metadata survives unrelated later omissions", StageIndexMetadataSurvivesUnrelatedLaterOmissions),
+            ("Stage bucket can be removed by a present later stages container", StageBucketCanBeRemovedByPresentLaterStagesContainer),
+            ("Mutagen contract exposes quest VMAD alias and stage members", MutagenContractExposesQuestVmadAliasAndStageMembers),
             ("No-op merge matches winning quest", NoOpMergeMatchesWinningQuest),
         };
 
@@ -561,6 +564,46 @@ public static class Program
         AssertEqual("StageToSetOnDeath", alias.Scripts![0].Properties![0].Name, "Expected the nested VMAD alias property name to be preserved.");
     }
 
+    private static void VmadQuestFragmentAliasesSurviveBlankPropertyNames()
+    {
+        var conflict = BuildConflict(
+            Spec("Skyrim.esm", Array.Empty<string>(), quest =>
+            {
+                quest.VirtualMachineAdapter = new QuestAdapter
+                {
+                    Scripts = [],
+                    Fragments = [],
+                    Aliases =
+                    [
+                        new QuestFragmentAlias
+                        {
+                            Property = new ScriptObjectProperty
+                            {
+                                Object = Link<IQuestGetter>("123456:Master.esm"),
+                                Alias = 10,
+                            },
+                            Scripts =
+                            [
+                                new ScriptEntry
+                                {
+                                    Name = "CartRiderScript",
+                                    Properties = [],
+                                },
+                            ],
+                        },
+                    ],
+                };
+            }),
+            Spec("PatchA.esp", new[] { "Skyrim.esm" }, quest => { quest.Priority = 50; }));
+
+        var merged = Merge(conflict);
+        AssertEqual(1, merged.VirtualMachineAdapter!.Aliases!.Count, "Expected a real-shaped quest fragment alias with a blank property name to survive sanitize/validate.");
+        var alias = merged.VirtualMachineAdapter!.Aliases!.Single();
+        AssertTrue(alias.Property is not null, "Expected the VMAD quest fragment alias property payload to survive.");
+        AssertEqual((short)10, alias.Property!.Alias, "Expected the VMAD alias binding to remain intact when the property name is blank.");
+        AssertEqual(1, alias.Scripts!.Count, "Expected the alias script list to remain allocated and populated.");
+    }
+
     private static void VmadAliasEmptyScriptListsStayAllocated()
     {
         var conflict = BuildConflict(
@@ -676,6 +719,52 @@ public static class Program
         AssertEqual((ushort)51, stage.Index, "Expected the stage index to survive unrelated later omissions.");
         AssertEqual(QuestStage.Flag.StartUpStage, stage.Flags, "Expected the stage index flags to be forwarded.");
         AssertEqual((byte)95, stage.Unknown, "Expected the stage index unknown value to be forwarded.");
+    }
+
+    private static void StageBucketCanBeRemovedByPresentLaterStagesContainer()
+    {
+        var conflict = BuildConflict(
+            Spec("Skyrim.esm", Array.Empty<string>(), quest =>
+            {
+                quest.Stages!.Add(new QuestStage
+                {
+                    Index = 51,
+                    Flags = QuestStage.Flag.StartUpStage,
+                    Unknown = 95,
+                    LogEntries = [],
+                });
+                quest.Stages!.Add(new QuestStage
+                {
+                    Index = 52,
+                    Flags = QuestStage.Flag.StartUpStage,
+                    Unknown = 96,
+                    LogEntries = [],
+                });
+            }),
+            Spec("PatchA.esp", new[] { "Skyrim.esm" }, quest =>
+            {
+                quest.Stages!.Add(new QuestStage
+                {
+                    Index = 52,
+                    Flags = QuestStage.Flag.StartUpStage,
+                    Unknown = 96,
+                    LogEntries = [],
+                });
+            }));
+
+        var merged = Merge(conflict);
+        AssertEqual(1, merged.Stages!.Count, "Expected a missing stage bucket to be removable when a later stages container is still present.");
+        AssertEqual((ushort)52, merged.Stages![0].Index, "Expected the remaining stage bucket to be the one still present in the later stages container.");
+    }
+
+    private static void MutagenContractExposesQuestVmadAliasAndStageMembers()
+    {
+        AssertTrue(typeof(QuestAdapter).GetProperty(nameof(QuestAdapter.Aliases)) is not null, "Expected Mutagen QuestAdapter to expose the Aliases property.");
+        AssertTrue(typeof(QuestFragmentAlias).GetProperty(nameof(QuestFragmentAlias.Property)) is not null, "Expected Mutagen QuestFragmentAlias to expose the Property payload.");
+        AssertTrue(typeof(QuestFragmentAlias).GetProperty(nameof(QuestFragmentAlias.Scripts)) is not null, "Expected Mutagen QuestFragmentAlias to expose the Scripts list.");
+        AssertTrue(typeof(QuestStage).GetProperty(nameof(QuestStage.Index)) is not null, "Expected Mutagen QuestStage to expose the Index field.");
+        AssertTrue(typeof(QuestStage).GetProperty(nameof(QuestStage.Flags)) is not null, "Expected Mutagen QuestStage to expose the Flags field.");
+        AssertTrue(typeof(QuestStage).GetProperty(nameof(QuestStage.Unknown)) is not null, "Expected Mutagen QuestStage to expose the Unknown field.");
     }
 
     private static void NoOpMergeMatchesWinningQuest()

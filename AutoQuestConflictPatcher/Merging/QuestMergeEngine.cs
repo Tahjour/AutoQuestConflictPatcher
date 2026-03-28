@@ -25,7 +25,7 @@ public sealed class QuestMergeEngine
     {
         var merged = conflict.WinningQuest.DeepCopy();
         var sources = conflict.ContextsLowToHigh
-            .Select(context => new MergeSource(context, context.Quest, Exists: true))
+            .Select(context => new MergeSource(context, context.Quest, Exists: true, ParentExists: true))
             .ToArray();
 
         _report.Log($"Merging {conflict.DisplayName} from {conflict.ContextsLowToHigh.Count} contexts.");
@@ -53,7 +53,7 @@ public sealed class QuestMergeEngine
                 continue;
             }
 
-            var projected = ProjectProperty(sources, property.Name);
+            var projected = ProjectProperty(sources, property.Name, propertyPath);
             if (IsLeafType(property.PropertyType))
             {
                 MergeLeafProperty(target, property, projected, propertyPath, conflict);
@@ -213,7 +213,7 @@ public sealed class QuestMergeEngine
         var buckets = new List<BucketMergePlan>();
         foreach (var bucketKey in orderedKeys)
         {
-            var bucketSources = ProjectBucketSources(compiled, bucketKey);
+            var bucketSources = ProjectBucketSources(compiled, bucketKey, treatEmptyContainerAsNoVote: false);
             if (!ShouldKeepBucket(bucketSources, conflict, propertyPath))
             {
                 continue;
@@ -244,7 +244,7 @@ public sealed class QuestMergeEngine
         var bucketPlans = new List<StableBucketPlan>();
         foreach (var bucketKey in allEntries.Select(static entry => entry.BucketKey).Distinct(StringComparer.Ordinal))
         {
-            var bucketSources = ProjectBucketSources(compiled, bucketKey);
+            var bucketSources = ProjectBucketSources(compiled, bucketKey, treatEmptyContainerAsNoVote: true);
             if (!ShouldKeepBucket(bucketSources, conflict, propertyPath))
             {
                 continue;
@@ -313,17 +313,37 @@ public sealed class QuestMergeEngine
 
     private static IReadOnlyList<MergeSource> ProjectBucketSources(
         IReadOnlyList<CompiledSource> compiled,
-        string bucketKey)
+        string bucketKey,
+        bool treatEmptyContainerAsNoVote)
     {
         return compiled
             .Select(source =>
             {
                 var entry = source.Entries.FirstOrDefault(candidate => candidate.BucketKey == bucketKey);
                 return entry is null
-                    ? new MergeSource(source.Source.Context, null, Exists: false)
-                    : new MergeSource(source.Source.Context, entry.Item, Exists: true);
+                    ? new MergeSource(
+                        source.Source.Context,
+                        null,
+                        Exists: false,
+                        ParentExists: IsBucketParentPresent(source, treatEmptyContainerAsNoVote))
+                    : new MergeSource(source.Source.Context, entry.Item, Exists: true, ParentExists: true);
             })
             .ToArray();
+    }
+
+    private static bool IsBucketParentPresent(CompiledSource source, bool treatEmptyContainerAsNoVote)
+    {
+        if (!source.Source.Exists)
+        {
+            return false;
+        }
+
+        if (!treatEmptyContainerAsNoVote)
+        {
+            return true;
+        }
+
+        return source.Entries.Count > 0;
     }
 
     private HpmoSelection? SelectPreferredBucketIndex(
@@ -335,8 +355,8 @@ public sealed class QuestMergeEngine
             {
                 var entry = source.Entries.FirstOrDefault(candidate => candidate.BucketKey == bucketKey);
                 return entry is null
-                    ? new MergeSource(source.Source.Context, null, Exists: false)
-                    : new MergeSource(source.Source.Context, entry.Index, Exists: true);
+                    ? new MergeSource(source.Source.Context, null, Exists: false, ParentExists: false)
+                    : new MergeSource(source.Source.Context, entry.Index, Exists: true, ParentExists: true);
             })
             .ToArray();
 
@@ -606,7 +626,7 @@ public sealed class QuestMergeEngine
         return QuestMergeSection.TopLevel;
     }
 
-    private static IReadOnlyList<MergeSource> ProjectProperty(IReadOnlyList<MergeSource> sources, string propertyName)
+    private IReadOnlyList<MergeSource> ProjectProperty(IReadOnlyList<MergeSource> sources, string propertyName, string propertyPath)
     {
         var projected = new MergeSource[sources.Count];
         for (var index = 0; index < sources.Count; index++)
@@ -614,15 +634,30 @@ public sealed class QuestMergeEngine
             var source = sources[index];
             if (!source.Exists || source.Value is null)
             {
-                projected[index] = new MergeSource(source.Context, null, Exists: false);
+                projected[index] = new MergeSource(source.Context, null, Exists: false, ParentExists: false);
                 continue;
             }
 
             var property = source.Value.GetType().GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance);
+            if (property is null)
+            {
+                _report.Log($"Skipped unavailable property projection for {propertyPath} on {source.Context.ModKey} ({source.Value.GetType().FullName}).");
+                projected[index] = new MergeSource(source.Context, null, Exists: false, ParentExists: false);
+                continue;
+            }
+
+            var value = property.GetValue(source.Value);
+            if (value is null && !IsLeafType(property.PropertyType))
+            {
+                projected[index] = new MergeSource(source.Context, null, Exists: false, ParentExists: false);
+                continue;
+            }
+
             projected[index] = new MergeSource(
                 source.Context,
-                property?.GetValue(source.Value),
-                Exists: true);
+                value,
+                Exists: true,
+                ParentExists: true);
         }
 
         return projected;
@@ -697,34 +732,20 @@ public sealed class QuestMergeEngine
     private static IReadOnlyList<MergeSource> BuildBucketPresenceSources(IReadOnlyList<MergeSource> sources)
     {
         var presenceSources = new List<MergeSource>(sources.Count);
-        for (var index = 0; index < sources.Count; index++)
+        foreach (var source in sources)
         {
-            var source = sources[index];
             if (source.Exists && source.Value is not null)
             {
-                presenceSources.Add(new MergeSource(source.Context, source.Value, Exists: true));
+                presenceSources.Add(new MergeSource(source.Context, source.Value, Exists: true, ParentExists: true));
                 continue;
             }
 
-            if (index == 0)
-            {
-                presenceSources.Add(new MergeSource(source.Context, MissingBucketValue, Exists: true));
-                continue;
-            }
-
-            var parentIndex = GetNearestParentSourceIndex(sources, index);
-            if (parentIndex < 0)
+            if (!source.ParentExists)
             {
                 continue;
             }
 
-            var parent = sources[parentIndex];
-            if (!parent.Exists || parent.Value is null)
-            {
-                continue;
-            }
-
-            presenceSources.Add(new MergeSource(source.Context, MissingBucketValue, Exists: true));
+            presenceSources.Add(new MergeSource(source.Context, MissingBucketValue, Exists: true, ParentExists: true));
         }
 
         return presenceSources;
@@ -732,12 +753,26 @@ public sealed class QuestMergeEngine
 
     private static IReadOnlyList<MergeSource> BuildObjectPresenceSources(IReadOnlyList<MergeSource> sources)
     {
-        return sources
-            .Where(static source => source.Exists)
-            .Select(source => source.Value is not null
-                ? new MergeSource(source.Context, source.Value, Exists: true)
-                : new MergeSource(source.Context, MissingBucketValue, Exists: true))
-            .ToArray();
+        var presenceSources = new List<MergeSource>(sources.Count);
+        foreach (var source in sources)
+        {
+            if (source.Exists)
+            {
+                presenceSources.Add(source.Value is not null
+                    ? new MergeSource(source.Context, source.Value, Exists: true, ParentExists: true)
+                    : new MergeSource(source.Context, MissingBucketValue, Exists: true, ParentExists: true));
+                continue;
+            }
+
+            if (!source.ParentExists)
+            {
+                continue;
+            }
+
+            presenceSources.Add(new MergeSource(source.Context, MissingBucketValue, Exists: true, ParentExists: true));
+        }
+
+        return presenceSources;
     }
 
     private static int GetNearestParentSourceIndex(IReadOnlyList<MergeSource> sources, int sourceIndex)
@@ -805,13 +840,14 @@ public sealed class QuestMergeEngine
 
     private static bool IsValidQuestFragmentAlias(QuestFragmentAlias alias)
     {
-        return alias.Property is not null && IsValidQuestFragmentAliasProperty(alias.Property);
+        return alias.Property is not null
+            && alias.Scripts is not null
+            && IsValidQuestFragmentAliasProperty(alias.Property);
     }
 
     private static bool IsValidQuestFragmentAliasProperty(ScriptObjectProperty property)
     {
         return property.Alias >= 0
-            && !string.IsNullOrWhiteSpace(property.Name)
             && property.Object.FormKey != default;
     }
 
@@ -893,14 +929,13 @@ public sealed class QuestMergeEngine
         for (var index = adapter.Aliases.Count - 1; index >= 0; index--)
         {
             var alias = adapter.Aliases[index];
+            EnsureListPropertyInitialized(alias, nameof(QuestFragmentAlias.Scripts));
             if (!IsValidQuestFragmentAlias(alias))
             {
                 adapter.Aliases.RemoveAt(index);
                 _report.Log($"Removed invalid VMAD alias with incomplete property payload from {conflict.DisplayName}.");
                 continue;
             }
-
-            EnsureListPropertyInitialized(alias, nameof(QuestFragmentAlias.Scripts));
             foreach (var script in alias.Scripts)
             {
                 EnsureListPropertyInitialized(script, nameof(ScriptEntry.Properties));
