@@ -352,3 +352,5 @@ MigrationBackup/
 .idea/
 *.sln.iml
 
+# OpenAI local codex configs
+.codex/
