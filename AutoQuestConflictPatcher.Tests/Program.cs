@@ -800,7 +800,7 @@ public static class Program
 
     private static Quest Merge(QuestConflict conflict)
     {
-        return new QuestMergeEngine(new MergeReport()).Merge(conflict);
+        return new QuestMergePipeline(new MergeReport()).Merge(conflict);
     }
 
     private static ConflictSpec Spec(string modName, string[] masters, Action<Quest> configure)
