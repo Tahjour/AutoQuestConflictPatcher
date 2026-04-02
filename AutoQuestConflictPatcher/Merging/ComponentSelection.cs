@@ -8,4 +8,5 @@ public sealed record ComponentSelection<T>(
     ModKey SelectedFrom,
     MergeConfidence Confidence,
     int Score,
-    string Reason) where T : class;
+    string Reason,
+    bool UnsafeAmbiguity = false) where T : class;

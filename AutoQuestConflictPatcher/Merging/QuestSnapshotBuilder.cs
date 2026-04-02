@@ -42,6 +42,7 @@ public sealed class QuestSnapshotBuilder
             BuildKeyedSection<ScriptEntry>(quest.VirtualMachineAdapter?.Scripts, static script => $"Script:{script.Name}"),
             BuildKeyedSection<QuestStage>(quest.Stages, static stage => $"Stage:{stage.Index}"),
             BuildKeyedSection<QuestObjective>(quest.Objectives, static objective => $"Objective:{objective.Index}"),
+            BuildOrderedTypedSection<QuestScriptFragment>(quest.VirtualMachineAdapter?.Fragments),
             BuildKeyedSection<QuestScriptFragment>(quest.VirtualMachineAdapter?.Fragments, BuildFragmentKey));
     }
 
@@ -88,6 +89,34 @@ public sealed class QuestSnapshotBuilder
         }
 
         return new OrderedSectionSnapshot<object>(present: true, items);
+    }
+
+    private static OrderedSectionSnapshot<T> BuildOrderedTypedSection<T>(IEnumerable? enumerable)
+        where T : class
+    {
+        if (enumerable is null)
+        {
+            return new OrderedSectionSnapshot<T>(present: false, []);
+        }
+
+        var items = new List<T>();
+        foreach (var item in enumerable)
+        {
+            if (item is null)
+            {
+                continue;
+            }
+
+            var clone = Clone(item) as T;
+            if (clone is null)
+            {
+                continue;
+            }
+
+            items.Add(clone);
+        }
+
+        return new OrderedSectionSnapshot<T>(present: true, items);
     }
 
     private static KeyedSectionSnapshot<T> BuildKeyedSection<T>(

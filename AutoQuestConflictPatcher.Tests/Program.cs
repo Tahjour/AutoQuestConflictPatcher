@@ -28,6 +28,8 @@ public static class Program
             ("Aliases keep HPMO slot when later winner omits bucket", AliasesKeepHpmoSlotWhenLaterWinnerOmitsBucket),
             ("Later ITM slot occurrence does not undo earlier meaningful slot", LaterItmSlotOccurrenceDoesNotUndoEarlierMeaningfulSlot),
             ("Remove and readd keeps reintroduced slot order", RemoveAndReaddKeepsReintroducedSlotOrder),
+            ("Fragment section keeps winner bundle when only winner edits fragments", FragmentSectionKeepsWinnerBundleWhenOnlyWinnerEditsFragments),
+            ("Fragment section falls back to safer whole winner bundle when contested", FragmentSectionFallsBackToSaferWholeWinnerBundleWhenContested),
             ("Stage log entries preserve deliberate exact duplicates", StageLogEntriesPreserveDeliberateExactDuplicates),
             ("Condition removals beat sibling ITM retention", ConditionRemovalsBeatSiblingItmRetention),
             ("Condition add remove readd keeps reintroduced value", ConditionAddRemoveReaddKeepsReintroducedValue),
@@ -42,6 +44,8 @@ public static class Program
             ("VMAD sanitizer removes aliases with null property payloads", VmadSanitizerRemovesAliasesWithNullPropertyPayloads),
             ("VMAD property type conflict falls back to whole-property HPMO", VmadPropertyTypeConflictFallsBackToWholePropertyHpmo),
             ("Stage index metadata survives unrelated later omissions", StageIndexMetadataSurvivesUnrelatedLaterOmissions),
+            ("Stage core keeps shared ITM flags and unknown values", StageCoreKeepsSharedItmFlagsAndUnknownValues),
+            ("Later sparse stage payload does not zero stage core", LaterSparseStagePayloadDoesNotZeroStageCore),
             ("Stage bucket can be removed by a present later stages container", StageBucketCanBeRemovedByPresentLaterStagesContainer),
             ("Mutagen contract exposes quest VMAD alias and stage members", MutagenContractExposesQuestVmadAliasAndStageMembers),
             ("No-op merge matches winning quest", NoOpMergeMatchesWinningQuest),
@@ -346,6 +350,61 @@ public static class Program
         var alias = merged.Aliases!.Single();
         AssertEqual(inserted.FormKey, ((IFormLinkGetter)alias.PackageData![0]).FormKey, "Expected the surviving inserted package to remain in the reintroduced slot.");
         AssertEqual(basePackage.FormKey, ((IFormLinkGetter)alias.PackageData![1]).FormKey, "Expected the reintroduced package to keep the later slot chosen by HPMO.");
+    }
+
+    private static void FragmentSectionKeepsWinnerBundleWhenOnlyWinnerEditsFragments()
+    {
+        var conflict = BuildConflict(
+            Spec("Dawnguard.esm", Array.Empty<string>(), quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Fragments!.Add(NewFragment(10, 0, "Fragment_0"));
+                quest.VirtualMachineAdapter!.Fragments!.Add(NewFragment(20, 0, "Fragment_2"));
+            }),
+            Spec("Growl.esp", new[] { "Dawnguard.esm" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Fragments!.Add(NewFragment(10, 0, "Fragment_0"));
+                quest.VirtualMachineAdapter!.Fragments!.Add(NewFragment(20, 0, "Fragment_2"));
+                quest.VirtualMachineAdapter!.Fragments!.Add(NewFragment(30, 0, "Fragment_10"));
+                quest.Priority = 25;
+            }));
+
+        var merged = Merge(conflict);
+        AssertSequenceEqual(
+            new[] { "Fragment_0", "Fragment_2", "Fragment_10" },
+            merged.VirtualMachineAdapter!.Fragments!.Select(static fragment => fragment.FragmentName).ToArray(),
+            "Expected the winner fragment bundle to be forwarded wholesale when only one source meaningfully edits fragments.");
+    }
+
+    private static void FragmentSectionFallsBackToSaferWholeWinnerBundleWhenContested()
+    {
+        var conflict = BuildConflict(
+            Spec("Dawnguard.esm", Array.Empty<string>(), quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Fragments!.Add(NewFragment(10, 0, "Fragment_0", "Script_Master"));
+                quest.VirtualMachineAdapter!.Fragments!.Add(NewFragment(20, 0, "Fragment_2", "Script_Master"));
+            }),
+            Spec("PatchA.esp", new[] { "Dawnguard.esm" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Fragments!.Add(NewFragment(10, 0, "Fragment_0", "Script_A"));
+                quest.VirtualMachineAdapter!.Fragments!.Add(NewFragment(20, 0, "Fragment_2", "Script_Master"));
+            }),
+            Spec("Winner.esp", new[] { "Dawnguard.esm" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                quest.VirtualMachineAdapter!.Fragments!.Add(NewFragment(10, 0, "Fragment_0", "Script_Winner"));
+                quest.VirtualMachineAdapter!.Fragments!.Add(NewFragment(20, 0, "Fragment_2", "Script_Master"));
+                quest.VirtualMachineAdapter!.Fragments!.Add(NewFragment(30, 0, "Fragment_10", "Script_Winner"));
+            }));
+
+        var merged = Merge(conflict);
+        AssertSequenceEqual(
+            new[] { "Script_Winner", "Script_Master", "Script_Winner" },
+            merged.VirtualMachineAdapter!.Fragments!.Select(static fragment => fragment.ScriptName).ToArray(),
+            "Expected contested fragment edits to fall back to the safer whole winner bundle instead of row-level mosaic merging.");
     }
 
     private static void StageLogEntriesPreserveDeliberateExactDuplicates()
@@ -721,6 +780,107 @@ public static class Program
         AssertEqual((byte)95, stage.Unknown, "Expected the stage index unknown value to be forwarded.");
     }
 
+    private static void StageCoreKeepsSharedItmFlagsAndUnknownValues()
+    {
+        var conflict = BuildConflict(
+            Spec("Skyrim.esm", Array.Empty<string>(), quest =>
+            {
+                quest.Stages!.Add(new QuestStage
+                {
+                    Index = 10,
+                    Flags = QuestStage.Flag.StartUpStage,
+                    Unknown = 95,
+                    LogEntries = [],
+                });
+            }),
+            Spec("USSEP.esp", new[] { "Skyrim.esm" }, quest =>
+            {
+                quest.Stages!.Add(new QuestStage
+                {
+                    Index = 10,
+                    Flags = QuestStage.Flag.StartUpStage,
+                    Unknown = 95,
+                    LogEntries = [],
+                });
+            }),
+            Spec("Winner.esp", new[] { "Skyrim.esm", "USSEP.esp" }, quest =>
+            {
+                quest.Stages!.Add(new QuestStage
+                {
+                    Index = 10,
+                    Flags = QuestStage.Flag.StartUpStage,
+                    Unknown = 95,
+                    LogEntries = [],
+                });
+                quest.Priority = 25;
+            }));
+
+        var merged = Merge(conflict);
+        var stage = merged.Stages!.Single();
+        AssertEqual((ushort)10, stage.Index, "Expected the merged stage to keep the stage key.");
+        AssertEqual(QuestStage.Flag.StartUpStage, stage.Flags, "Expected shared ITM stage flags to be forwarded.");
+        AssertEqual((byte)95, stage.Unknown, "Expected shared ITM stage unknown to be forwarded.");
+    }
+
+    private static void LaterSparseStagePayloadDoesNotZeroStageCore()
+    {
+        var conflict = BuildConflict(
+            Spec("Skyrim.esm", Array.Empty<string>(), quest =>
+            {
+                quest.Stages!.Add(new QuestStage
+                {
+                    Index = 10,
+                    Flags = QuestStage.Flag.StartUpStage,
+                    Unknown = 95,
+                    LogEntries =
+                    [
+                        new QuestLogEntry
+                        {
+                            Entry = "Master",
+                            Conditions = [],
+                        },
+                    ],
+                });
+            }),
+            Spec("PatchA.esp", new[] { "Skyrim.esm" }, quest =>
+            {
+                quest.Stages!.Add(new QuestStage
+                {
+                    Index = 10,
+                    Flags = QuestStage.Flag.StartUpStage,
+                    Unknown = 95,
+                    LogEntries =
+                    [
+                        new QuestLogEntry
+                        {
+                            Entry = "PatchA",
+                            Conditions = [],
+                        },
+                    ],
+                });
+            }),
+            Spec("Winner.esp", new[] { "Skyrim.esm", "PatchA.esp" }, quest =>
+            {
+                quest.Stages!.Add(new QuestStage
+                {
+                    Index = 10,
+                    LogEntries =
+                    [
+                        new QuestLogEntry
+                        {
+                            Entry = "Winner",
+                            Conditions = [],
+                        },
+                    ],
+                });
+            }));
+
+        var merged = Merge(conflict);
+        var stage = merged.Stages!.Single();
+        AssertEqual(QuestStage.Flag.StartUpStage, stage.Flags, "Expected a sparse later stage payload not to zero the stage flags.");
+        AssertEqual((byte)95, stage.Unknown, "Expected a sparse later stage payload not to zero the stage unknown byte.");
+    }
+
     private static void StageBucketCanBeRemovedByPresentLaterStagesContainer()
     {
         var conflict = BuildConflict(
@@ -874,6 +1034,17 @@ public static class Program
                     Properties = [],
                 },
             ],
+        };
+    }
+
+    private static QuestScriptFragment NewFragment(ushort stage, int stageIndex, string fragmentName, string? scriptName = null)
+    {
+        return new QuestScriptFragment
+        {
+            Stage = stage,
+            StageIndex = stageIndex,
+            ScriptName = scriptName ?? $"QF_Test_{stage}_{fragmentName}",
+            FragmentName = fragmentName,
         };
     }
 

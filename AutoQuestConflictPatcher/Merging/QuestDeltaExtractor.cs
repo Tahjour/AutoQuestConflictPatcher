@@ -1,4 +1,5 @@
 using Mutagen.Bethesda.Plugins;
+using Mutagen.Bethesda.Skyrim;
 
 namespace AutoQuestConflictPatcher.Merging;
 
@@ -27,7 +28,9 @@ public sealed class QuestDeltaExtractor
         BuildKeyedEntries("VmadAlias", previous?.VmadAliases, current.VmadAliases, current.Context.ModKey, current.Context.LoadOrderIndex, entries);
         BuildKeyedEntries("VmadScript", previous?.VmadScripts, current.VmadScripts, current.Context.ModKey, current.Context.LoadOrderIndex, entries);
         BuildKeyedEntries("Stage", previous?.Stages, current.Stages, current.Context.ModKey, current.Context.LoadOrderIndex, entries);
+        BuildStageCoreEntries(previous?.Stages, current.Stages, current.Context.ModKey, current.Context.LoadOrderIndex, entries);
         BuildKeyedEntries("Objective", previous?.Objectives, current.Objectives, current.Context.ModKey, current.Context.LoadOrderIndex, entries);
+        BuildOrderedEntry("FragmentSection", previous?.FragmentSection, current.FragmentSection, current.Context.ModKey, current.Context.LoadOrderIndex, entries);
         BuildKeyedEntries("Fragment", previous?.Fragments, current.Fragments, current.Context.ModKey, current.Context.LoadOrderIndex, entries);
         BuildOrderedEntry("DialogConditions", previous?.DialogConditions, current.DialogConditions, current.Context.ModKey, current.Context.LoadOrderIndex, entries);
         BuildOrderedEntry("EventConditions", previous?.EventConditions, current.EventConditions, current.Context.ModKey, current.Context.LoadOrderIndex, entries);
@@ -50,10 +53,12 @@ public sealed class QuestDeltaExtractor
                 : null;
             var previousFingerprint = QuestFingerprint.Exact(previousValue);
             var currentFingerprint = QuestFingerprint.Exact(currentValue);
-            var kind = GetKind(previous is not null && previous.Scalars.ContainsKey(key), current.Scalars.ContainsKey(key), previousFingerprint, currentFingerprint);
+            var classification = Classify(previous is not null && previous.Scalars.ContainsKey(key), current.Scalars.ContainsKey(key), previousFingerprint, currentFingerprint);
             entries[new ComponentKey("Scalar", key)] = new ComponentDelta(
                 new ComponentKey("Scalar", key),
-                kind,
+                classification.Kind,
+                classification.Evidence,
+                classification.RemovalKind,
                 previousFingerprint,
                 currentFingerprint,
                 current.Context.ModKey,
@@ -83,9 +88,12 @@ public sealed class QuestDeltaExtractor
             var currentExists = current.Items.TryGetValue(key, out currentValue);
             var previousFingerprint = previousExists ? QuestFingerprint.Exact(previousValue) : "<missing>";
             var currentFingerprint = currentExists ? QuestFingerprint.Exact(currentValue) : "<missing>";
+            var classification = Classify(previousExists, currentExists, previousFingerprint, currentFingerprint);
             entries[new ComponentKey(kind, key)] = new ComponentDelta(
                 new ComponentKey(kind, key),
-                GetKind(previousExists, currentExists, previousFingerprint, currentFingerprint),
+                classification.Kind,
+                classification.Evidence,
+                classification.RemovalKind,
                 previousFingerprint,
                 currentFingerprint,
                 modKey,
@@ -93,10 +101,63 @@ public sealed class QuestDeltaExtractor
         }
     }
 
-    private static void BuildOrderedEntry(
+    private static void BuildStageCoreEntries(
+        KeyedSectionSnapshot<QuestStage>? previous,
+        KeyedSectionSnapshot<QuestStage> current,
+        ModKey modKey,
+        int loadOrderIndex,
+        IDictionary<ComponentKey, ComponentDelta> entries)
+    {
+        if (!current.Present)
+        {
+            return;
+        }
+
+        foreach (var key in current.Items.Keys.Union(previous?.Items.Keys ?? [], StringComparer.Ordinal))
+        {
+            QuestStage? previousStage = null;
+            var previousExists = previous is not null && previous.Items.TryGetValue(key, out previousStage);
+            QuestStage? currentStage = null;
+            var currentExists = current.Items.TryGetValue(key, out currentStage);
+            if (!currentExists || currentStage is null)
+            {
+                continue;
+            }
+
+            BuildStageCoreEntry(key, "Index", previousExists ? previousStage!.Index : null, currentStage.Index, previousExists, modKey, loadOrderIndex, entries);
+            BuildStageCoreEntry(key, "Flags", previousExists ? previousStage!.Flags : null, currentStage.Flags, previousExists, modKey, loadOrderIndex, entries);
+            BuildStageCoreEntry(key, "Unknown", previousExists ? previousStage!.Unknown : null, currentStage.Unknown, previousExists, modKey, loadOrderIndex, entries);
+        }
+    }
+
+    private static void BuildStageCoreEntry(
+        string stageKey,
+        string fieldName,
+        object? previousValue,
+        object currentValue,
+        bool previousExists,
+        ModKey modKey,
+        int loadOrderIndex,
+        IDictionary<ComponentKey, ComponentDelta> entries)
+    {
+        var previousFingerprint = previousExists ? QuestFingerprint.Exact(previousValue) : "<missing>";
+        var currentFingerprint = QuestFingerprint.Exact(currentValue);
+        var classification = Classify(previousExists, currentExists: true, previousFingerprint, currentFingerprint);
+        entries[new ComponentKey("StageCore", $"{stageKey}.{fieldName}")] = new ComponentDelta(
+            new ComponentKey("StageCore", $"{stageKey}.{fieldName}"),
+            classification.Kind,
+            classification.Evidence,
+            classification.RemovalKind,
+            previousFingerprint,
+            currentFingerprint,
+            modKey,
+            loadOrderIndex);
+    }
+
+    private static void BuildOrderedEntry<T>(
         string kind,
-        OrderedSectionSnapshot<object>? previous,
-        OrderedSectionSnapshot<object> current,
+        OrderedSectionSnapshot<T>? previous,
+        OrderedSectionSnapshot<T> current,
         ModKey modKey,
         int loadOrderIndex,
         IDictionary<ComponentKey, ComponentDelta> entries)
@@ -110,16 +171,19 @@ public sealed class QuestDeltaExtractor
             ? QuestFingerprint.Exact(previous.Items)
             : "<missing>";
         var currentFingerprint = QuestFingerprint.Exact(current.Items);
+        var classification = Classify(previous is not null && previous.Present, current.Present, previousFingerprint, currentFingerprint);
         entries[new ComponentKey(kind, kind)] = new ComponentDelta(
             new ComponentKey(kind, kind),
-            GetKind(previous is not null && previous.Present, current.Present, previousFingerprint, currentFingerprint),
+            classification.Kind,
+            classification.Evidence,
+            classification.RemovalKind,
             previousFingerprint,
             currentFingerprint,
             modKey,
             loadOrderIndex);
     }
 
-    private static QuestDeltaKind GetKind(
+    private static (QuestDeltaKind Kind, QuestDeltaEvidenceKind Evidence, QuestRemovalKind RemovalKind) Classify(
         bool previousExists,
         bool currentExists,
         string previousFingerprint,
@@ -127,16 +191,16 @@ public sealed class QuestDeltaExtractor
     {
         if (!previousExists && currentExists)
         {
-            return QuestDeltaKind.Added;
+            return (QuestDeltaKind.Added, QuestDeltaEvidenceKind.Addition, QuestRemovalKind.None);
         }
 
         if (previousExists && !currentExists)
         {
-            return QuestDeltaKind.Removed;
+            return (QuestDeltaKind.Removed, QuestDeltaEvidenceKind.ExplicitRemoval, QuestRemovalKind.Explicit);
         }
 
         return StringComparer.Ordinal.Equals(previousFingerprint, currentFingerprint)
-            ? QuestDeltaKind.Unchanged
-            : QuestDeltaKind.Modified;
+            ? (QuestDeltaKind.Unchanged, QuestDeltaEvidenceKind.PureCarryForward, QuestRemovalKind.None)
+            : (QuestDeltaKind.Modified, QuestDeltaEvidenceKind.DirectModification, QuestRemovalKind.None);
     }
 }

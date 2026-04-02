@@ -38,11 +38,19 @@ public sealed class IntentSupportScorer
             .Select(entry => fingerprint(entry.Value))
             .FirstOrDefault();
 
+        string? previousExistingFingerprint = null;
+        var volatility = 0;
+
         for (var index = 0; index < timeline.Count; index++)
         {
             var entry = timeline[index];
             var delta = GetDelta(deltas, key, index);
             var deltaKind = delta?.Kind ?? QuestDeltaKind.Unchanged;
+            if (deltaKind == QuestDeltaKind.Removed && !entry.ParentExists)
+            {
+                deltaKind = QuestDeltaKind.Unchanged;
+            }
+
             if (deltaKind == QuestDeltaKind.Removed && !HasMasterAncestorValue(timeline, index))
             {
                 deltaKind = QuestDeltaKind.Unchanged;
@@ -52,9 +60,15 @@ public sealed class IntentSupportScorer
                 ? fingerprint(entry.Value)
                 : "<missing>";
 
+            var candidateFingerprint = deltaKind == QuestDeltaKind.Removed && entry.ParentExists
+                ? "<removed>"
+                : entryFingerprint;
+            var dependencySupport = HasDependencySupport(key, dependencyGraph, deltas, index);
+            var priorFingerprint = previousExistingFingerprint;
+
             if (entry.Exists && entry.Value is not null)
             {
-                hpmoSources.Add(new MergeSource(entry.Context, entry.Value, Exists: true, ParentExists: true));
+                hpmoSources.Add(new MergeSource(entry.Context, entry.Value, Exists: true, ParentExists: entry.ParentExists));
                 if (!sharedSet)
                 {
                     sharedFingerprint = entryFingerprint;
@@ -65,20 +79,17 @@ public sealed class IntentSupportScorer
                     sharedMatch = false;
                 }
             }
-            else if (deltaKind == QuestDeltaKind.Removed)
+            else if (deltaKind == QuestDeltaKind.Removed && entry.ParentExists)
             {
                 hpmoSources.Add(new MergeSource(entry.Context, RemovedState.Value, Exists: true, ParentExists: true));
                 sharedMatch = false;
             }
             else
             {
-                hpmoSources.Add(new MergeSource(entry.Context, null, Exists: false, ParentExists: false));
+                hpmoSources.Add(new MergeSource(entry.Context, null, Exists: false, ParentExists: entry.ParentExists));
                 sharedMatch = false;
             }
 
-            var candidateFingerprint = deltaKind == QuestDeltaKind.Removed
-                ? "<removed>"
-                : entryFingerprint;
             if (!candidates.TryGetValue(candidateFingerprint, out var candidate))
             {
                 candidate = new Candidate<T>(candidateFingerprint);
@@ -95,29 +106,55 @@ public sealed class IntentSupportScorer
             candidate.LastTimelineIndex = index;
             candidate.LastExists = entry.Exists;
 
-            if (deltaKind is QuestDeltaKind.Added or QuestDeltaKind.Modified or QuestDeltaKind.Removed)
+            if (priorFingerprint is not null
+                && (entry.Exists || deltaKind == QuestDeltaKind.Removed)
+                && !StringComparer.Ordinal.Equals(priorFingerprint, candidateFingerprint))
             {
-                candidate.MeaningfulOccurrences++;
-                candidate.Score += 3;
-                candidate.Score += index;
-                if (candidate.MeaningfulOccurrences > 1)
-                {
-                    candidate.Score += 1;
-                }
-
-                if (HasMasterLinkedPriorIntent(candidate, entry.Context))
-                {
-                    candidate.Score += 2;
-                }
-
-                if (HasDependencySupport(key, dependencyGraph, deltas, index))
-                {
-                    candidate.Score += 2;
-                }
-
-                candidate.HighestMeaningfulSourceIndex = index;
-                candidate.LastMeaningfulModKey = entry.Context.ModKey;
+                volatility++;
             }
+
+            if (entry.Exists || deltaKind == QuestDeltaKind.Removed)
+            {
+                previousExistingFingerprint = candidateFingerprint;
+            }
+
+            var evidence = ClassifyEvidence(candidate, deltaKind, entry.ParentExists, dependencySupport, candidateFingerprint, priorFingerprint);
+            candidate.LastEvidence = evidence;
+
+            if (!IsMeaningful(evidence))
+            {
+                continue;
+            }
+
+            candidate.MeaningfulOccurrences++;
+            candidate.Score += GetEvidenceWeight(evidence);
+            candidate.Score += index;
+            candidate.MeaningfulSupporters.Add(entry.Context.ModKey);
+
+            if (HasMasterLinkedPriorIntent(candidate, entry.Context))
+            {
+                candidate.Score += 2;
+            }
+
+            if (dependencySupport)
+            {
+                candidate.BundleSupportCount++;
+                candidate.Score += 2;
+            }
+
+            if (evidence == HpmoEvidenceKind.StructuralReassertion)
+            {
+                candidate.ReassertionCount++;
+                candidate.Score += 1;
+            }
+
+            if (evidence == HpmoEvidenceKind.ExplicitRemoval)
+            {
+                candidate.ExplicitRemovalCount++;
+            }
+
+            candidate.HighestMeaningfulSourceIndex = index;
+            candidate.LastMeaningfulModKey = entry.Context.ModKey;
         }
 
         if (officialOriginFingerprint is not null && !(sharedSet && sharedMatch))
@@ -133,34 +170,55 @@ public sealed class IntentSupportScorer
             throw new InvalidOperationException($"No candidates were available for {key}.");
         }
 
-        foreach (var candidate in candidates.Values)
-        {
-            candidate.Score -= penaltySelector(candidate.LastValue);
-        }
-
-        var hpmo = HpmoSelector.Select(
+        var hpmoGroups = HpmoSelector.Analyze(
             hpmoSources,
             _officialMasters,
             value => ReferenceEquals(value, RemovedState.Value)
                 ? "<removed>"
                 : fingerprint(value as T));
+        var hpmoByFingerprint = hpmoGroups.ToDictionary(static group => group.Fingerprint, StringComparer.Ordinal);
+        var hpmo = hpmoGroups
+            .OrderByDescending(static group => group.MeaningfulOccurrences)
+            .ThenByDescending(static group => group.BranchSupportCount)
+            .ThenByDescending(static group => group.ReassertionCount)
+            .ThenByDescending(static group => group.TotalOccurrences)
+            .ThenBy(static group => group.VolatilityPenalty)
+            .ThenByDescending(static group => group.HighestMeaningfulSelection?.SelectedSourceIndex ?? int.MinValue)
+            .ThenByDescending(static group => group.HighestSelection.SelectedSourceIndex)
+            .ThenBy(static group => group.Fingerprint, StringComparer.Ordinal)
+            .FirstOrDefault();
 
-        Candidate<T>? best;
+        foreach (var candidate in candidates.Values)
+        {
+            if (hpmoByFingerprint.TryGetValue(candidate.Fingerprint, out var group))
+            {
+                candidate.Score += group.BranchSupportCount;
+                candidate.Score += group.ReassertionCount;
+                candidate.Score -= group.VolatilityPenalty;
+            }
+
+            candidate.ValidatorPenalty = penaltySelector(candidate.LastValue);
+            candidate.Score -= candidate.ValidatorPenalty;
+        }
+
         if (sharedSet && sharedMatch && sharedFingerprint is not null)
         {
-            best = candidates[sharedFingerprint];
+            var sharedCandidate = candidates[sharedFingerprint];
             return new ComponentSelection<T>(
-                best.LastValue,
+                sharedCandidate.LastValue,
                 Exists: true,
-                best.LastContext.ModKey,
+                sharedCandidate.LastContext.ModKey,
                 MergeConfidence.Medium,
-                best.Score,
+                sharedCandidate.Score,
                 "Shared carry-forward state across all sources.");
         }
 
-        best = candidates.Values
+        var best = candidates.Values
             .OrderByDescending(static candidate => candidate.Score)
             .ThenByDescending(static candidate => candidate.MeaningfulOccurrences)
+            .ThenByDescending(static candidate => candidate.MeaningfulSupporters.Count)
+            .ThenByDescending(static candidate => candidate.ReassertionCount)
+            .ThenByDescending(static candidate => candidate.BundleSupportCount)
             .ThenByDescending(static candidate => candidate.TotalOccurrences)
             .ThenByDescending(static candidate => candidate.HighestMeaningfulSourceIndex)
             .ThenByDescending(static candidate => candidate.LastTimelineIndex)
@@ -180,9 +238,11 @@ public sealed class IntentSupportScorer
             .Where(candidate => !ReferenceEquals(candidate, best))
             .OrderByDescending(static candidate => candidate.Score)
             .ThenByDescending(static candidate => candidate.MeaningfulOccurrences)
+            .ThenByDescending(static candidate => candidate.MeaningfulSupporters.Count)
             .FirstOrDefault();
 
-        var confidence = GetConfidence(best, runnerUp);
+        var confidence = GetConfidence(best, runnerUp, volatility);
+        var unsafeAmbiguity = confidence == MergeConfidence.Low && runnerUp is not null;
         var exists = !StringComparer.Ordinal.Equals(best.Fingerprint, "<removed>");
         return new ComponentSelection<T>(
             exists ? best.LastValue : null,
@@ -190,9 +250,115 @@ public sealed class IntentSupportScorer
             best.LastContext.ModKey,
             confidence,
             best.Score,
-            exists
-                ? $"Selected {best.Fingerprint} from {best.LastContext.ModKey}."
-                : $"Selected removal from {best.LastContext.ModKey}.");
+            BuildReason(best, hpmoByFingerprint.GetValueOrDefault(best.Fingerprint), unsafeAmbiguity),
+            unsafeAmbiguity);
+    }
+
+    private static HpmoEvidenceKind ClassifyEvidence<T>(
+        Candidate<T> candidate,
+        QuestDeltaKind deltaKind,
+        bool parentExists,
+        bool dependencySupport,
+        string candidateFingerprint,
+        string? previousExistingFingerprint)
+        where T : class
+    {
+        if (deltaKind == QuestDeltaKind.Removed && parentExists)
+        {
+            return HpmoEvidenceKind.ExplicitRemoval;
+        }
+
+        if (deltaKind == QuestDeltaKind.Added)
+        {
+            return dependencySupport
+                ? HpmoEvidenceKind.CohesiveOverride
+                : HpmoEvidenceKind.Addition;
+        }
+
+        if (deltaKind == QuestDeltaKind.Modified)
+        {
+            if (candidate.TotalOccurrences > 0
+                && previousExistingFingerprint is not null
+                && !StringComparer.Ordinal.Equals(previousExistingFingerprint, candidateFingerprint))
+            {
+                return HpmoEvidenceKind.StructuralReassertion;
+            }
+
+            return dependencySupport
+                ? HpmoEvidenceKind.CohesiveOverride
+                : HpmoEvidenceKind.DirectModification;
+        }
+
+        if (candidate.MeaningfulOccurrences > 0
+            && previousExistingFingerprint is not null
+            && !StringComparer.Ordinal.Equals(previousExistingFingerprint, candidateFingerprint))
+        {
+            return HpmoEvidenceKind.StructuralReassertion;
+        }
+
+        return HpmoEvidenceKind.PureCarryForward;
+    }
+
+    private static int GetEvidenceWeight(HpmoEvidenceKind evidence)
+    {
+        return evidence switch
+        {
+            HpmoEvidenceKind.CohesiveOverride => 5,
+            HpmoEvidenceKind.StructuralReassertion => 4,
+            HpmoEvidenceKind.Addition => 3,
+            HpmoEvidenceKind.DirectModification => 3,
+            HpmoEvidenceKind.ExplicitRemoval => 3,
+            HpmoEvidenceKind.ParentDivergenceOnly => 1,
+            _ => 0,
+        };
+    }
+
+    private static bool IsMeaningful(HpmoEvidenceKind evidence)
+    {
+        return evidence is not HpmoEvidenceKind.PureCarryForward
+            and not HpmoEvidenceKind.ParentDivergenceOnly;
+    }
+
+    private static string BuildReason<T>(
+        Candidate<T> candidate,
+        HpmoGroup? hpmoGroup,
+        bool unsafeAmbiguity)
+        where T : class
+    {
+        var reasons = new List<string>();
+        if (candidate.ReassertionCount > 0)
+        {
+            reasons.Add($"{candidate.ReassertionCount} branch reassertion(s)");
+        }
+
+        if (candidate.BundleSupportCount > 0)
+        {
+            reasons.Add($"{candidate.BundleSupportCount} cohesive edit(s)");
+        }
+
+        if (candidate.ValidatorPenalty > 0)
+        {
+            reasons.Add($"validator penalty {candidate.ValidatorPenalty}");
+        }
+
+        if (hpmoGroup is not null && hpmoGroup.BranchSupportCount > 1)
+        {
+            reasons.Add($"{hpmoGroup.BranchSupportCount} HPMO branch support vote(s)");
+        }
+
+        if (unsafeAmbiguity)
+        {
+            reasons.Add("unsafe ambiguity");
+        }
+
+        if (reasons.Count == 0)
+        {
+            return StringComparer.Ordinal.Equals(candidate.Fingerprint, "<removed>")
+                ? $"Selected removal from {candidate.LastContext.ModKey}."
+                : $"Selected {candidate.Fingerprint} from {candidate.LastContext.ModKey}.";
+        }
+
+        return $"{(StringComparer.Ordinal.Equals(candidate.Fingerprint, "<removed>") ? "Selected removal" : $"Selected {candidate.Fingerprint}")} from {candidate.LastContext.ModKey} because {string.Join(", ", reasons)}.";
     }
 
     private static bool HasDependencySupport(
@@ -216,6 +382,17 @@ public sealed class IntentSupportScorer
         }
 
         return false;
+    }
+
+    private static bool HasMasterLinkedPriorIntent<T>(Candidate<T> candidate, QuestSourceContext context)
+        where T : class
+    {
+        if (!candidate.HasMeaningfulSource)
+        {
+            return false;
+        }
+
+        return context.Masters.Contains(candidate.LastMeaningfulModKey);
     }
 
     private static bool HasMasterAncestorValue<T>(
@@ -246,17 +423,6 @@ public sealed class IntentSupportScorer
         return false;
     }
 
-    private static bool HasMasterLinkedPriorIntent<T>(Candidate<T> candidate, QuestSourceContext context)
-        where T : class
-    {
-        if (!candidate.HasMeaningfulSource)
-        {
-            return false;
-        }
-
-        return context.Masters.Contains(candidate.LastMeaningfulModKey);
-    }
-
     private static ComponentDelta? GetDelta(
         IReadOnlyList<QuestDelta> deltas,
         ComponentKey key,
@@ -270,7 +436,7 @@ public sealed class IntentSupportScorer
         return deltas[timelineIndex].TryGet(key, out var delta) ? delta : null;
     }
 
-    private static MergeConfidence GetConfidence<T>(Candidate<T> best, Candidate<T>? runnerUp)
+    private static MergeConfidence GetConfidence<T>(Candidate<T> best, Candidate<T>? runnerUp, int volatility)
         where T : class
     {
         if (best.Score <= 0)
@@ -280,28 +446,35 @@ public sealed class IntentSupportScorer
 
         if (runnerUp is null)
         {
-            return MergeConfidence.High;
+            return volatility >= 3 ? MergeConfidence.Medium : MergeConfidence.High;
         }
 
         var gap = best.Score - runnerUp.Score;
-        if (gap >= 3)
-        {
-            return MergeConfidence.High;
-        }
+        var confidence = gap >= 4
+            ? MergeConfidence.High
+            : gap >= 2
+                ? MergeConfidence.Medium
+                : MergeConfidence.Low;
 
-        if (gap >= 1)
+        if (volatility >= 4 && confidence == MergeConfidence.High)
         {
             return MergeConfidence.Medium;
         }
 
-        return MergeConfidence.Low;
+        if (volatility >= 3 && confidence == MergeConfidence.Medium)
+        {
+            return MergeConfidence.Low;
+        }
+
+        return confidence;
     }
 
     public sealed record ComponentTimelineEntry<T>(
         QuestSourceContext Context,
         T? Value,
         bool Exists,
-        int? OrderIndex) where T : class;
+        int? OrderIndex,
+        bool ParentExists = true) where T : class;
 
     private sealed class Candidate<T> where T : class
     {
@@ -331,5 +504,17 @@ public sealed class IntentSupportScorer
         public bool HasMeaningfulSource => HighestMeaningfulSourceIndex != int.MinValue;
 
         public ModKey LastMeaningfulModKey { get; set; }
+
+        public int ReassertionCount { get; set; }
+
+        public int BundleSupportCount { get; set; }
+
+        public int ExplicitRemovalCount { get; set; }
+
+        public int ValidatorPenalty { get; set; }
+
+        public HpmoEvidenceKind LastEvidence { get; set; }
+
+        public HashSet<ModKey> MeaningfulSupporters { get; } = [];
     }
 }

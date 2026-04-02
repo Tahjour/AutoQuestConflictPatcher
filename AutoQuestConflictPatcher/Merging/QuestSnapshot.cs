@@ -15,6 +15,7 @@ public sealed class QuestSnapshot
         KeyedSectionSnapshot<ScriptEntry> vmadScripts,
         KeyedSectionSnapshot<QuestStage> stages,
         KeyedSectionSnapshot<QuestObjective> objectives,
+        OrderedSectionSnapshot<QuestScriptFragment> fragmentSection,
         KeyedSectionSnapshot<QuestScriptFragment> fragments)
     {
         Context = context;
@@ -27,6 +28,7 @@ public sealed class QuestSnapshot
         VmadScripts = vmadScripts;
         Stages = stages;
         Objectives = objectives;
+        FragmentSection = fragmentSection;
         Fragments = fragments;
     }
 
@@ -49,6 +51,8 @@ public sealed class QuestSnapshot
     public KeyedSectionSnapshot<QuestStage> Stages { get; }
 
     public KeyedSectionSnapshot<QuestObjective> Objectives { get; }
+
+    public OrderedSectionSnapshot<QuestScriptFragment> FragmentSection { get; }
 
     public KeyedSectionSnapshot<QuestScriptFragment> Fragments { get; }
 }

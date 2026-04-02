@@ -10,9 +10,27 @@ public enum QuestDeltaKind
     Modified = 3,
 }
 
+public enum QuestDeltaEvidenceKind
+{
+    PureCarryForward = 0,
+    Addition = 1,
+    DirectModification = 2,
+    StructuralReassertion = 3,
+    ExplicitRemoval = 4,
+}
+
+public enum QuestRemovalKind
+{
+    None = 0,
+    Explicit = 1,
+    NoVote = 2,
+}
+
 public sealed record ComponentDelta(
     ComponentKey Component,
     QuestDeltaKind Kind,
+    QuestDeltaEvidenceKind Evidence,
+    QuestRemovalKind RemovalKind,
     string PreviousFingerprint,
     string CurrentFingerprint,
     ModKey ModKey,

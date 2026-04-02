@@ -116,7 +116,8 @@ public sealed class QuestMergePipeline
                         snapshot.Context,
                         snapshot.Scalars.TryGetValue(key, out var value) ? new ScalarBox(value) : null,
                         snapshot.Scalars.ContainsKey(key),
-                        OrderIndex: null))
+                        OrderIndex: null,
+                        ParentExists: true))
                     .ToArray(),
                 deltas,
                 dependencies,
@@ -246,6 +247,25 @@ public sealed class QuestMergePipeline
             }
 
             var chosen = DeepCopy(selection.Value)!;
+            chosen.Index = ParseStageIndex(key, chosen.Index);
+            chosen.Flags = ResolveStageCoreField(
+                snapshots,
+                deltas,
+                dependencies,
+                key,
+                "Flags",
+                chosen.Flags,
+                static stage => new ScalarBox(stage.Flags),
+                box => box is null ? "<missing>" : box.Value?.ToString() ?? "<missing>");
+            chosen.Unknown = ResolveStageCoreField(
+                snapshots,
+                deltas,
+                dependencies,
+                key,
+                "Unknown",
+                chosen.Unknown,
+                static stage => new ScalarBox(stage.Unknown),
+                box => box is null ? "<missing>" : box.Value?.ToString() ?? "<missing>");
             if (legacyStages.TryGetValue(key, out var legacyStage))
             {
                 EnsureListPropertyInitialized(chosen, nameof(QuestStage.LogEntries));
@@ -325,6 +345,35 @@ public sealed class QuestMergePipeline
         IReadOnlyList<QuestDelta> deltas,
         QuestDependencyGraph dependencies)
     {
+        var winningModKey = snapshots[^1].Context.ModKey;
+        var fragmentSectionSelection = _scorer.Select(
+            new ComponentKey("FragmentSection", "FragmentSection"),
+            BuildOrderedTimeline(snapshots, static snapshot => snapshot.FragmentSection),
+            deltas,
+            dependencies,
+            static box => box is null ? "<missing>" : QuestFingerprint.Exact(box.Items));
+        var fragmentSectionChangeCount = CountMeaningfulSources(deltas, new ComponentKey("FragmentSection", "FragmentSection"));
+
+        if (fragmentSectionSelection.Exists
+            && fragmentSectionSelection.Value is not null
+            && (fragmentSectionChangeCount <= 1
+                || fragmentSectionSelection.SelectedFrom == winningModKey
+                || fragmentSectionSelection.UnsafeAmbiguity
+                || !CanSafelyMergeFragmentsIndividually(snapshots, deltas)))
+        {
+            merged.VirtualMachineAdapter ??= NewAdapter();
+            EnsureListPropertyInitialized(merged.VirtualMachineAdapter, nameof(QuestAdapter.Fragments));
+            ReplaceListContents(
+                GetListProperty<QuestScriptFragment>(merged.VirtualMachineAdapter, nameof(QuestAdapter.Fragments)),
+                fragmentSectionSelection.Value.Items);
+
+            _report.Log(
+                fragmentSectionSelection.SelectedFrom == winningModKey
+                    ? "Fragment section copied from winner due cohesive fragment support."
+                    : $"Fragment section copied wholesale from {fragmentSectionSelection.SelectedFrom} due conservative fragment fallback.");
+            return;
+        }
+
         var resolved = new List<(int Order, QuestScriptFragment Fragment)>();
         foreach (var key in snapshots.SelectMany(static snapshot => snapshot.Fragments.Items.Keys).Distinct(StringComparer.Ordinal))
         {
@@ -454,17 +503,172 @@ public sealed class QuestMergePipeline
         where T : class
     {
         return snapshots
+                .Select(snapshot =>
+                {
+                    var section = selector(snapshot);
+                    var exists = section.Items.TryGetValue(key, out var value);
+                    return new IntentSupportScorer.ComponentTimelineEntry<T>(
+                        snapshot.Context,
+                        value,
+                        exists,
+                        section.Order.TryGetValue(key, out var order) ? order : null,
+                        section.Present);
+                })
+            .ToArray();
+    }
+
+    private static IReadOnlyList<IntentSupportScorer.ComponentTimelineEntry<FragmentSectionBox>> BuildOrderedTimeline(
+        IReadOnlyList<QuestSnapshot> snapshots,
+        Func<QuestSnapshot, OrderedSectionSnapshot<QuestScriptFragment>> selector)
+    {
+        return snapshots
             .Select(snapshot =>
             {
                 var section = selector(snapshot);
-                var exists = section.Items.TryGetValue(key, out var value);
-                return new IntentSupportScorer.ComponentTimelineEntry<T>(
+                return new IntentSupportScorer.ComponentTimelineEntry<FragmentSectionBox>(
                     snapshot.Context,
-                    value,
-                    exists,
-                    section.Order.TryGetValue(key, out var order) ? order : null);
+                    section.Present ? new FragmentSectionBox(section.Items) : null,
+                    section.Present,
+                    OrderIndex: null,
+                    ParentExists: true);
             })
             .ToArray();
+    }
+
+    private static bool CanSafelyMergeFragmentsIndividually(
+        IReadOnlyList<QuestSnapshot> snapshots,
+        IReadOnlyList<QuestDelta> deltas)
+    {
+        foreach (var key in snapshots.SelectMany(static snapshot => snapshot.Fragments.Items.Keys).Distinct(StringComparer.Ordinal))
+        {
+            var meaningfulCount = CountMeaningfulSources(deltas, new ComponentKey("Fragment", key));
+            if (meaningfulCount > 1)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static int CountMeaningfulSources(
+        IReadOnlyList<QuestDelta> deltas,
+        ComponentKey key)
+    {
+        return deltas.Count(delta =>
+            delta.TryGet(key, out var componentDelta)
+            && componentDelta.Kind is not QuestDeltaKind.Unchanged);
+    }
+
+    private static ushort ParseStageIndex(string key, ushort fallback)
+    {
+        const string prefix = "Stage:";
+        if (!key.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            return fallback;
+        }
+
+        return ushort.TryParse(key[prefix.Length..], out var parsed)
+            ? parsed
+            : fallback;
+    }
+
+    private TField ResolveStageCoreField<TField>(
+        IReadOnlyList<QuestSnapshot> snapshots,
+        IReadOnlyList<QuestDelta> deltas,
+        QuestDependencyGraph dependencies,
+        string stageKey,
+        string fieldName,
+        TField fallback,
+        Func<QuestStage, ScalarBox> selector,
+        Func<ScalarBox?, string> fingerprint)
+    {
+        var timeline = snapshots.Select(snapshot =>
+                BuildStageCoreTimelineEntry(snapshot, stageKey, selector))
+            .ToArray();
+
+        if (TrySelectStageCarryForwardConsensus(timeline, out var carryForwardValue))
+        {
+            return (TField)carryForwardValue!;
+        }
+
+        var selection = _scorer.Select(
+            new ComponentKey("StageCore", $"{stageKey}.{fieldName}"),
+            timeline,
+            deltas,
+            dependencies,
+            fingerprint);
+
+        if (!selection.Exists || selection.Value?.Value is null)
+        {
+            return fallback;
+        }
+
+        return (TField)selection.Value.Value;
+    }
+
+    private static IntentSupportScorer.ComponentTimelineEntry<ScalarBox> BuildStageCoreTimelineEntry(
+        QuestSnapshot snapshot,
+        string stageKey,
+        Func<QuestStage, ScalarBox> selector)
+    {
+        var exists = snapshot.Stages.Items.TryGetValue(stageKey, out var stage) && stage is not null;
+        return new IntentSupportScorer.ComponentTimelineEntry<ScalarBox>(
+            snapshot.Context,
+            exists ? selector(stage!) : null,
+            exists,
+            snapshot.Stages.Order.TryGetValue(stageKey, out var order) ? order : null,
+            snapshot.Stages.Present);
+    }
+
+    private static bool TrySelectStageCarryForwardConsensus(
+        IReadOnlyList<IntentSupportScorer.ComponentTimelineEntry<ScalarBox>> timeline,
+        out object? value)
+    {
+        value = null;
+        var existing = timeline
+            .Where(static entry => entry.Exists && entry.Value?.Value is not null)
+            .ToArray();
+        if (existing.Length < 2)
+        {
+            return false;
+        }
+
+        var latest = existing[^1].Value!.Value;
+        if (!IsDefaultValue(latest))
+        {
+            return false;
+        }
+
+        var nonDefaultGroup = existing
+            .Where(entry => !IsDefaultValue(entry.Value!.Value))
+            .GroupBy(entry => QuestFingerprint.Exact(entry.Value!.Value), StringComparer.Ordinal)
+            .OrderByDescending(static group => group.Count())
+            .ThenByDescending(group => group.Max(static entry => entry.Context.LoadOrderIndex))
+            .FirstOrDefault();
+        if (nonDefaultGroup is null || nonDefaultGroup.Count() < 2)
+        {
+            return false;
+        }
+
+        value = nonDefaultGroup.Last().Value!.Value;
+        return true;
+    }
+
+    private static bool IsDefaultValue(object? value)
+    {
+        if (value is null)
+        {
+            return true;
+        }
+
+        var type = value.GetType();
+        if (!type.IsValueType)
+        {
+            return false;
+        }
+
+        return Equals(value, System.Activator.CreateInstance(type));
     }
 
     private static int ResolveOrder<T>(
@@ -523,6 +727,16 @@ public sealed class QuestMergePipeline
         }
 
         public object? Value { get; }
+    }
+
+    private sealed class FragmentSectionBox
+    {
+        public FragmentSectionBox(IReadOnlyList<QuestScriptFragment> items)
+        {
+            Items = items;
+        }
+
+        public IReadOnlyList<QuestScriptFragment> Items { get; }
     }
 
     private static void EnsureListPropertyInitialized(object target, string propertyName)

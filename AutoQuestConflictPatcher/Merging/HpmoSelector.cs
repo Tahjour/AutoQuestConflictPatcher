@@ -2,6 +2,17 @@ using Mutagen.Bethesda.Plugins;
 
 namespace AutoQuestConflictPatcher.Merging;
 
+public enum HpmoEvidenceKind
+{
+    PureCarryForward = 0,
+    ParentDivergenceOnly = 1,
+    Addition = 2,
+    DirectModification = 3,
+    CohesiveOverride = 4,
+    StructuralReassertion = 5,
+    ExplicitRemoval = 6,
+}
+
 public sealed record HpmoSelection(
     object? Value,
     ModKey SelectedFrom,
@@ -16,6 +27,9 @@ public sealed record HpmoGroup(
     string Fingerprint,
     int TotalOccurrences,
     int MeaningfulOccurrences,
+    int BranchSupportCount,
+    int ReassertionCount,
+    int VolatilityPenalty,
     HpmoSelection? HighestMeaningfulSelection,
     HpmoSelection HighestSelection,
     int FirstSourceIndex);
@@ -54,7 +68,7 @@ public static class HpmoSelector
                 sourceIndex,
                 source,
                 key,
-                IsMeaningfulOccurrence(
+                ClassifyOccurrence(
                     source,
                     key,
                     parentFingerprint,
@@ -81,7 +95,10 @@ public static class HpmoSelector
     {
         var bestGroup = Analyze(sources, officialMasters, fingerprint)
             .OrderByDescending(static group => group.MeaningfulOccurrences)
+            .ThenByDescending(static group => group.BranchSupportCount)
+            .ThenByDescending(static group => group.ReassertionCount)
             .ThenByDescending(static group => group.TotalOccurrences)
+            .ThenBy(static group => group.VolatilityPenalty)
             .ThenByDescending(static group => group.HighestMeaningfulSelection?.SelectedSourceIndex ?? int.MinValue)
             .ThenByDescending(static group => group.HighestSelection.SelectedSourceIndex)
             .ThenByDescending(static group => group.FirstSourceIndex)
@@ -91,7 +108,7 @@ public static class HpmoSelector
         return bestGroup?.HighestMeaningfulSelection ?? bestGroup?.HighestSelection;
     }
 
-    private static bool IsMeaningfulOccurrence(
+    private static HpmoEvidenceKind ClassifyOccurrence(
         MergeSource source,
         string fingerprint,
         string? parentFingerprint,
@@ -99,36 +116,53 @@ public static class HpmoSelector
         IReadOnlyList<Occurrence> priorMatches,
         OfficialMasterClassifier officialMasters)
     {
+        if (StringComparer.Ordinal.Equals(fingerprint, "<removed>") && source.ParentExists)
+        {
+            return HpmoEvidenceKind.ExplicitRemoval;
+        }
+
         if (parentFingerprint is null)
         {
-            return false;
+            return HpmoEvidenceKind.PureCarryForward;
         }
 
         var differsFromParent = !StringComparer.Ordinal.Equals(fingerprint, parentFingerprint);
         var differsFromPrevious = previousFingerprint is not null
             && !StringComparer.Ordinal.Equals(fingerprint, previousFingerprint);
         var hasPriorMatch = priorMatches.Count > 0;
-        var hasPriorMeaningfulMatch = priorMatches.Any(static match => match.IsMeaningful);
+        var hasPriorMeaningfulMatch = priorMatches.Any(match => IsMeaningful(match.Evidence));
         var hasPriorMeaningfulMasterMatch = priorMatches.Any(match =>
-            match.IsMeaningful
+            IsMeaningful(match.Evidence)
             && source.Context.Masters.Contains(match.Source.Context.ModKey));
 
         if (differsFromParent)
         {
             if (StringComparer.Ordinal.Equals(parentFingerprint, "<missing>"))
             {
-                return true;
+                return HpmoEvidenceKind.Addition;
             }
 
-            if (!hasPriorMatch)
+            if (hasPriorMatch && differsFromPrevious)
             {
-                return true;
+                return HpmoEvidenceKind.StructuralReassertion;
             }
 
-            return hasPriorMeaningfulMatch;
+            return officialMasters.IsOfficial(source.Context.ModKey)
+                ? HpmoEvidenceKind.ParentDivergenceOnly
+                : HpmoEvidenceKind.DirectModification;
         }
 
-        return differsFromPrevious && hasPriorMeaningfulMasterMatch;
+        if (differsFromPrevious && hasPriorMeaningfulMasterMatch)
+        {
+            return HpmoEvidenceKind.StructuralReassertion;
+        }
+
+        if (differsFromPrevious && hasPriorMeaningfulMatch)
+        {
+            return HpmoEvidenceKind.ParentDivergenceOnly;
+        }
+
+        return HpmoEvidenceKind.PureCarryForward;
     }
 
     private static HpmoGroup BuildGroup(string fingerprint, IEnumerable<Occurrence> occurrences)
@@ -137,7 +171,7 @@ public static class HpmoSelector
             .OrderBy(static occurrence => occurrence.SourceIndex)
             .ToArray();
         var meaningful = ordered
-            .Where(static occurrence => occurrence.IsMeaningful)
+            .Where(static occurrence => IsMeaningful(occurrence.Evidence))
             .ToArray();
 
         var highestMeaningful = meaningful.Length > 0
@@ -149,6 +183,9 @@ public static class HpmoSelector
             fingerprint,
             ordered.Length,
             meaningful.Length,
+            meaningful.Select(static occurrence => occurrence.Source.Context.ModKey).Distinct().Count(),
+            meaningful.Count(static occurrence => occurrence.Evidence == HpmoEvidenceKind.StructuralReassertion),
+            Math.Max(0, meaningful.Length - meaningful.Select(static occurrence => occurrence.SourceIndex).Distinct().Count()),
             highestMeaningful,
             highest,
             ordered[0].SourceIndex);
@@ -172,6 +209,12 @@ public static class HpmoSelector
             highestOccurrence.Source.Context.ModKey);
     }
 
+    private static bool IsMeaningful(HpmoEvidenceKind evidence)
+    {
+        return evidence is not HpmoEvidenceKind.PureCarryForward
+            and not HpmoEvidenceKind.ParentDivergenceOnly;
+    }
+
     private static int GetNearestParentSourceIndex(IReadOnlyList<MergeSource> sources, int sourceIndex)
     {
         var source = sources[sourceIndex];
@@ -190,6 +233,5 @@ public static class HpmoSelector
         int SourceIndex,
         MergeSource Source,
         string Fingerprint,
-        bool IsMeaningful);
-
+        HpmoEvidenceKind Evidence);
 }
