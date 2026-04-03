@@ -169,7 +169,14 @@ public sealed class QuestSnapshotBuilder
             return null;
         }
 
-        return DeepCopyHelper.DeepCopyObject(value);
+        try
+        {
+            return DeepCopyHelper.DeepCopyObject(value);
+        }
+        catch
+        {
+            return value;
+        }
     }
 
     private static string BuildQuestAliasKey(QuestAlias alias)

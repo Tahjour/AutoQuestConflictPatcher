@@ -28,11 +28,12 @@ public static class Program
         var report = new MergeReport();
         var scanner = new QuestConflictScanner();
         var merger = new QuestMergePipeline(report, state.DataFolderPath.ToString());
+        var noOpDetector = new QuestNoOpDetector(report);
 
         foreach (var conflict in scanner.Scan(state, settings, report))
         {
             var merged = merger.Merge(conflict);
-            if (merged.Equals(conflict.WinningQuest))
+            if (noOpDetector.IsSemanticallyEqual(merged, conflict.WinningQuest, conflict.DisplayName))
             {
                 report.Log($"No patch needed for {conflict.DisplayName}.");
                 continue;

@@ -14,6 +14,7 @@ public sealed class QuestMergePipeline
     private readonly QuestSnapshotBuilder _snapshotBuilder;
     private readonly QuestDeltaExtractor _deltaExtractor;
     private readonly QuestMergeEngine _legacy;
+    private readonly OfficialMasterClassifier _officialMasters;
     private readonly IntentSupportScorer _scorer;
     private readonly MergeValidator _validator;
 
@@ -23,7 +24,8 @@ public sealed class QuestMergePipeline
         _snapshotBuilder = new QuestSnapshotBuilder();
         _deltaExtractor = new QuestDeltaExtractor();
         _legacy = new QuestMergeEngine(report, dataFolderPath);
-        _scorer = new IntentSupportScorer(new OfficialMasterClassifier(dataFolderPath));
+        _officialMasters = new OfficialMasterClassifier(dataFolderPath);
+        _scorer = new IntentSupportScorer(_officialMasters);
         _validator = new MergeValidator();
     }
 
@@ -151,9 +153,6 @@ public sealed class QuestMergePipeline
 
         var legacyAliasMap = merged.Aliases?.ToDictionary(static alias => $"Alias:{alias.ID}", StringComparer.Ordinal)
             ?? new Dictionary<string, QuestAlias>(StringComparer.Ordinal);
-        var legacyVmadAliasMap = merged.VirtualMachineAdapter?.Aliases?.ToDictionary(BuildVmadAliasKey, StringComparer.Ordinal)
-            ?? new Dictionary<string, QuestFragmentAlias>(StringComparer.Ordinal);
-
         var resolvedAliases = new List<(int Order, bool FromWinner, QuestAlias Alias)>();
         var resolvedVmadAliases = new List<(int Order, bool FromWinner, QuestFragmentAlias Alias)>();
         var confidenceCounts = new Dictionary<MergeConfidence, int>();
@@ -178,21 +177,17 @@ public sealed class QuestMergePipeline
 
             if (aliasSelection.Exists && aliasSelection.Value is not null)
             {
-                var legacyAlias = legacyAliasMap.GetValueOrDefault(key);
-                var chosenAlias = _validator.AreCompatible(legacyAlias, aliasSelection.Value)
-                    ? CopyPreferLegacy(legacyAlias, aliasSelection.Value)
-                    : DeepCopy(aliasSelection.Value)!;
+                var chosenAlias = ResolveAliasPayload(key, aliasSelection, legacyAliasMap.GetValueOrDefault(key), snapshots, deltas, dependencies);
                 resolvedAliases.Add((ResolveOrder(aliasSelection, snapshots, key, static snapshot => snapshot.QuestAliases), aliasSelection.SelectedFrom == winningModKey, chosenAlias));
             }
 
-            if (vmadSelection.Exists && vmadSelection.Value is not null)
+        if (vmadSelection.Exists && vmadSelection.Value is not null)
+        {
+            var chosenAlias = ChooseRicherVmadAlias(merged.VirtualMachineAdapter?.Aliases?.FirstOrDefault(existing => StringComparer.Ordinal.Equals(BuildVmadAliasKey(existing), key)), vmadSelection.Value);
+            if (chosenAlias.Property is not null && chosenAlias.Property.Alias >= 0 && chosenAlias.Property.Object.FormKey != default)
             {
-                var legacyAlias = legacyVmadAliasMap.GetValueOrDefault(key);
-                var chosenAlias = ChooseRicherVmadAlias(legacyAlias, vmadSelection.Value);
-                if (chosenAlias.Property is not null && chosenAlias.Property.Alias >= 0 && chosenAlias.Property.Object.FormKey != default)
-                {
-                    resolvedVmadAliases.Add((ResolveOrder(vmadSelection, snapshots, key, static snapshot => snapshot.VmadAliases), vmadSelection.SelectedFrom == winningModKey, chosenAlias));
-                }
+                resolvedVmadAliases.Add((ResolveOrder(vmadSelection, snapshots, key, static snapshot => snapshot.VmadAliases), vmadSelection.SelectedFrom == winningModKey, chosenAlias));
+            }
                 else
                 {
                     _report.Log($"Dropped invalid VMAD alias bundle {key} during intent-aware merge.");
@@ -201,7 +196,7 @@ public sealed class QuestMergePipeline
         }
 
         EnsureListPropertyInitialized(merged, nameof(Quest.Aliases));
-        ReplaceListContents(GetListProperty<QuestAlias>(merged, nameof(Quest.Aliases)), resolvedAliases
+        ReplaceExistingListContents(GetListProperty<QuestAlias>(merged, nameof(Quest.Aliases)), resolvedAliases
             .OrderBy(static entry => entry.Order)
             .ThenBy(static entry => entry.FromWinner)
             .ThenBy(static entry => entry.Alias.ID)
@@ -211,7 +206,7 @@ public sealed class QuestMergePipeline
         {
             merged.VirtualMachineAdapter ??= NewAdapter();
             EnsureListPropertyInitialized(merged.VirtualMachineAdapter, nameof(QuestAdapter.Aliases));
-            ReplaceListContents(GetListProperty<QuestFragmentAlias>(merged.VirtualMachineAdapter, nameof(QuestAdapter.Aliases)), resolvedVmadAliases
+            ReplaceExistingListContents(GetListProperty<QuestFragmentAlias>(merged.VirtualMachineAdapter, nameof(QuestAdapter.Aliases)), resolvedVmadAliases
                 .OrderBy(static entry => entry.Order)
                 .ThenBy(static entry => entry.FromWinner)
                 .ThenBy(entry => entry.Alias.Property?.Alias ?? short.MaxValue)
@@ -227,8 +222,6 @@ public sealed class QuestMergePipeline
         IReadOnlyList<QuestDelta> deltas,
         QuestDependencyGraph dependencies)
     {
-        var legacyStages = merged.Stages?.ToDictionary(static stage => $"Stage:{stage.Index}", StringComparer.Ordinal)
-            ?? new Dictionary<string, QuestStage>(StringComparer.Ordinal);
         var resolved = new List<(int Order, QuestStage Stage)>();
         var confidenceCounts = new Dictionary<MergeConfidence, int>();
 
@@ -256,7 +249,8 @@ public sealed class QuestMergePipeline
                 "Flags",
                 chosen.Flags,
                 static stage => new ScalarBox(stage.Flags),
-                box => box is null ? "<missing>" : box.Value?.ToString() ?? "<missing>");
+                box => box is null ? "<missing>" : box.Value?.ToString() ?? "<missing>",
+                static stage => stage.LogEntries is not null && stage.LogEntries.Count > 0);
             chosen.Unknown = ResolveStageCoreField(
                 snapshots,
                 deltas,
@@ -265,18 +259,14 @@ public sealed class QuestMergePipeline
                 "Unknown",
                 chosen.Unknown,
                 static stage => new ScalarBox(stage.Unknown),
-                box => box is null ? "<missing>" : box.Value?.ToString() ?? "<missing>");
-            if (legacyStages.TryGetValue(key, out var legacyStage))
-            {
-                EnsureListPropertyInitialized(chosen, nameof(QuestStage.LogEntries));
-                ReplaceListContents(GetListProperty<QuestLogEntry>(chosen, nameof(QuestStage.LogEntries)), legacyStage.LogEntries);
-            }
+                box => box is null ? "<missing>" : box.Value?.ToString() ?? "<missing>",
+                static stage => stage.LogEntries is not null && stage.LogEntries.Count > 0);
 
             resolved.Add((ResolveOrder(selection, snapshots, key, static snapshot => snapshot.Stages), chosen));
         }
 
         EnsureListPropertyInitialized(merged, nameof(Quest.Stages));
-        ReplaceListContents(GetListProperty<QuestStage>(merged, nameof(Quest.Stages)), resolved.OrderBy(static entry => entry.Order).ThenBy(static entry => entry.Stage.Index).Select(static entry => entry.Stage));
+        ReplaceExistingListContents(GetListProperty<QuestStage>(merged, nameof(Quest.Stages)), resolved.OrderBy(static entry => entry.Order).ThenBy(static entry => entry.Stage.Index).Select(static entry => entry.Stage));
 
         LogConfidenceSummary("Stage bundle", confidenceCounts);
     }
@@ -301,11 +291,11 @@ public sealed class QuestMergePipeline
                 continue;
             }
 
-            resolved.Add((ResolveOrder(selection, snapshots, key, static snapshot => snapshot.Objectives), DeepCopy(selection.Value)!));
+            resolved.Add((ResolveOrder(selection, snapshots, key, static snapshot => snapshot.Objectives), ResolveObjectivePayload(selection)));
         }
 
         EnsureListPropertyInitialized(merged, nameof(Quest.Objectives));
-        ReplaceListContents(GetListProperty<QuestObjective>(merged, nameof(Quest.Objectives)), resolved.OrderBy(static entry => entry.Order).ThenBy(static entry => entry.Objective.Index).Select(static entry => entry.Objective));
+        ReplaceExistingListContents(GetListProperty<QuestObjective>(merged, nameof(Quest.Objectives)), resolved.OrderBy(static entry => entry.Order).ThenBy(static entry => entry.Objective.Index).Select(static entry => entry.Objective));
     }
 
     private void ResolveQuestScripts(
@@ -328,14 +318,14 @@ public sealed class QuestMergePipeline
                 continue;
             }
 
-            resolved.Add((ResolveOrder(selection, snapshots, key, static snapshot => snapshot.VmadScripts), DeepCopy(selection.Value)!));
+            resolved.Add((ResolveOrder(selection, snapshots, key, static snapshot => snapshot.VmadScripts), ResolveQuestScriptPayload(key, selection, snapshots, deltas, dependencies)));
         }
 
         if (resolved.Count > 0 || merged.VirtualMachineAdapter is not null)
         {
             merged.VirtualMachineAdapter ??= NewAdapter();
             EnsureListPropertyInitialized(merged.VirtualMachineAdapter, nameof(QuestAdapter.Scripts));
-            ReplaceListContents(GetListProperty<ScriptEntry>(merged.VirtualMachineAdapter, nameof(QuestAdapter.Scripts)), resolved.OrderBy(static entry => entry.Order).ThenBy(entry => entry.Script.Name, StringComparer.OrdinalIgnoreCase).Select(static entry => entry.Script));
+            ReplaceExistingListContents(GetListProperty<ScriptEntry>(merged.VirtualMachineAdapter, nameof(QuestAdapter.Scripts)), resolved.OrderBy(static entry => entry.Order).ThenBy(entry => entry.Script.Name, StringComparer.OrdinalIgnoreCase).Select(static entry => entry.Script));
         }
     }
 
@@ -396,7 +386,7 @@ public sealed class QuestMergePipeline
         {
             merged.VirtualMachineAdapter ??= NewAdapter();
             EnsureListPropertyInitialized(merged.VirtualMachineAdapter, nameof(QuestAdapter.Fragments));
-            ReplaceListContents(GetListProperty<QuestScriptFragment>(merged.VirtualMachineAdapter, nameof(QuestAdapter.Fragments)), resolved.OrderBy(static entry => entry.Order).Select(static entry => entry.Fragment));
+            ReplaceExistingListContents(GetListProperty<QuestScriptFragment>(merged.VirtualMachineAdapter, nameof(QuestAdapter.Fragments)), resolved.OrderBy(static entry => entry.Order).Select(static entry => entry.Fragment));
         }
     }
 
@@ -455,35 +445,6 @@ public sealed class QuestMergePipeline
     {
         EnsureListPropertyInitialized(target, propertyName);
         ReplaceListContents(GetListProperty<T>(target, propertyName), source);
-    }
-
-    private static QuestAlias CopyPreferLegacy(QuestAlias? legacyAlias, QuestAlias selectedAlias)
-    {
-        if (legacyAlias is null)
-        {
-            return DeepCopy(selectedAlias)!;
-        }
-
-        return DeepCopy(legacyAlias)!;
-    }
-
-    private QuestFragmentAlias ChooseRicherVmadAlias(QuestFragmentAlias? legacyAlias, QuestFragmentAlias selectedAlias)
-    {
-        if (legacyAlias is null)
-        {
-            return DeepCopy(selectedAlias)!;
-        }
-
-        if (!_validator.AreCompatible(legacyAlias, selectedAlias))
-        {
-            return DeepCopy(selectedAlias)!;
-        }
-
-        var legacyPropertyCount = legacyAlias.Scripts?.Sum(static script => script.Properties?.Count ?? 0) ?? 0;
-        var selectedPropertyCount = selectedAlias.Scripts?.Sum(static script => script.Properties?.Count ?? 0) ?? 0;
-        return legacyPropertyCount >= selectedPropertyCount
-            ? DeepCopy(legacyAlias)!
-            : DeepCopy(selectedAlias)!;
     }
 
     private static string BuildVmadAliasKey(QuestFragmentAlias alias)
@@ -581,13 +542,14 @@ public sealed class QuestMergePipeline
         string fieldName,
         TField fallback,
         Func<QuestStage, ScalarBox> selector,
-        Func<ScalarBox?, string> fingerprint)
+        Func<ScalarBox?, string> fingerprint,
+        Func<QuestStage, bool> sparseHeuristic)
     {
         var timeline = snapshots.Select(snapshot =>
                 BuildStageCoreTimelineEntry(snapshot, stageKey, selector))
             .ToArray();
 
-        if (TrySelectStageCarryForwardConsensus(timeline, out var carryForwardValue))
+        if (TrySelectStageCarryForwardConsensus(timeline, snapshots, stageKey, sparseHeuristic, out var carryForwardValue))
         {
             return (TField)carryForwardValue!;
         }
@@ -623,6 +585,9 @@ public sealed class QuestMergePipeline
 
     private static bool TrySelectStageCarryForwardConsensus(
         IReadOnlyList<IntentSupportScorer.ComponentTimelineEntry<ScalarBox>> timeline,
+        IReadOnlyList<QuestSnapshot> snapshots,
+        string stageKey,
+        Func<QuestStage, bool> sparseHeuristic,
         out object? value)
     {
         value = null;
@@ -640,6 +605,21 @@ public sealed class QuestMergePipeline
             return false;
         }
 
+        QuestStage? latestStage = null;
+        for (var index = snapshots.Count - 1; index >= 0; index--)
+        {
+            if (snapshots[index].Stages.Items.TryGetValue(stageKey, out var stage) && stage is not null)
+            {
+                latestStage = stage;
+                break;
+            }
+        }
+
+        if (latestStage is null || !sparseHeuristic(latestStage))
+        {
+            return false;
+        }
+
         var nonDefaultGroup = existing
             .Where(entry => !IsDefaultValue(entry.Value!.Value))
             .GroupBy(entry => QuestFingerprint.Exact(entry.Value!.Value), StringComparer.Ordinal)
@@ -653,6 +633,351 @@ public sealed class QuestMergePipeline
 
         value = nonDefaultGroup.Last().Value!.Value;
         return true;
+    }
+
+    private QuestAlias ResolveAliasPayload(
+        string aliasKey,
+        ComponentSelection<QuestAlias> selection,
+        QuestAlias? legacyAlias,
+        IReadOnlyList<QuestSnapshot> snapshots,
+        IReadOnlyList<QuestDelta> deltas,
+        QuestDependencyGraph dependencies)
+    {
+        var chosen = DeepCopy(selection.Value)!;
+        chosen.Flags = ResolveAliasFlags(aliasKey, chosen.Flags, snapshots, deltas, dependencies);
+        if ((!chosen.Flags.HasValue || chosen.Flags.Value == default) && legacyAlias?.Flags is { } legacyFlags && legacyFlags != default)
+        {
+            chosen.Flags = legacyFlags;
+        }
+        ReplaceUntypedListProperty(
+            chosen,
+            nameof(QuestAlias.PackageData),
+            ResolveNestedStableCollection(
+                snapshots,
+                deltas,
+                dependencies,
+                aliasKey,
+                static snapshot => snapshot.QuestAliases,
+                static alias => alias.PackageData,
+                static item => $"FormLink:{GetFormLinkKey(item)}",
+                "QuestAliasPackageData"));
+        ReplaceUntypedListProperty(
+            chosen,
+            nameof(QuestAlias.Keywords),
+            ResolveNestedStableCollection(
+                snapshots,
+                deltas,
+                dependencies,
+                aliasKey,
+                static snapshot => snapshot.QuestAliases,
+                static alias => alias.Keywords,
+                static item => $"FormLink:{GetFormLinkKey(item)}",
+                "QuestAliasKeyword"));
+        ReplaceUntypedListProperty(
+            chosen,
+            nameof(QuestAlias.Factions),
+            ResolveNestedStableCollection(
+                snapshots,
+                deltas,
+                dependencies,
+                aliasKey,
+                static snapshot => snapshot.QuestAliases,
+                static alias => alias.Factions,
+                static item => $"FormLink:{GetFormLinkKey(item)}",
+                "QuestAliasFaction"));
+        ReplaceUntypedListProperty(
+            chosen,
+            nameof(QuestAlias.Spells),
+            ResolveNestedStableCollection(
+                snapshots,
+                deltas,
+                dependencies,
+                aliasKey,
+                static snapshot => snapshot.QuestAliases,
+                static alias => alias.Spells,
+                static item => $"FormLink:{GetFormLinkKey(item)}",
+                "QuestAliasSpell"));
+        ReplaceUntypedListProperty(
+            chosen,
+            nameof(QuestAlias.Items),
+            ResolveNestedStableCollection(
+                snapshots,
+                deltas,
+                dependencies,
+                aliasKey,
+                static snapshot => snapshot.QuestAliases,
+                static alias => alias.Items,
+                static item => $"Item:{GetContainerItemKey(item)}",
+                "QuestAliasItem"));
+        ReplaceUntypedListProperty(
+            chosen,
+            nameof(QuestAlias.Conditions),
+            ResolveNestedStableCollection(
+                snapshots,
+                deltas,
+                dependencies,
+                aliasKey,
+                static snapshot => snapshot.QuestAliases,
+                static alias => alias.Conditions,
+                static item => $"Condition:{QuestFingerprint.ConditionNear(item)}",
+                "QuestAliasCondition",
+                legacyAlias is null
+                    ? null
+                    : BuildLegacyNestedItemMap(legacyAlias.Conditions, static item => $"Condition:{QuestFingerprint.ConditionNear(item)}")));
+        return chosen;
+    }
+
+    private QuestObjective ResolveObjectivePayload(ComponentSelection<QuestObjective> selection)
+    {
+        return DeepCopy(selection.Value)!;
+    }
+
+    private ScriptEntry ResolveQuestScriptPayload(
+        string scriptKey,
+        ComponentSelection<ScriptEntry> selection,
+        IReadOnlyList<QuestSnapshot> snapshots,
+        IReadOnlyList<QuestDelta> deltas,
+        QuestDependencyGraph dependencies)
+    {
+        var chosen = DeepCopy(selection.Value)!;
+        ReplaceUntypedListProperty(
+            chosen,
+            nameof(ScriptEntry.Properties),
+            ResolveNestedStableCollection(
+                snapshots,
+                deltas,
+                dependencies,
+                scriptKey,
+                static snapshot => snapshot.VmadScripts,
+                static script => script.Properties,
+                static item => $"Property:{GetNormalizedText(GetPropertyValue(item, "Name"))}",
+                "VmadScriptProperty"));
+        return chosen;
+    }
+
+    private QuestAlias.Flag? ResolveAliasFlags(
+        string aliasKey,
+        QuestAlias.Flag? fallback,
+        IReadOnlyList<QuestSnapshot> snapshots,
+        IReadOnlyList<QuestDelta> deltas,
+        QuestDependencyGraph dependencies)
+    {
+        var timeline = snapshots
+            .Select(snapshot =>
+            {
+                var exists = snapshot.QuestAliases.Items.TryGetValue(aliasKey, out var alias) && alias is not null;
+                return new IntentSupportScorer.ComponentTimelineEntry<ScalarBox>(
+                    snapshot.Context,
+                    exists ? new ScalarBox(alias!.Flags) : null,
+                    exists,
+                    snapshot.QuestAliases.Order.TryGetValue(aliasKey, out var order) ? order : null,
+                    snapshot.QuestAliases.Present);
+            })
+            .ToArray();
+
+        var selection = _scorer.Select(
+            new ComponentKey("QuestAliasCore", $"{aliasKey}.Flags"),
+            timeline,
+            deltas,
+            dependencies,
+            box => box is null ? "<missing>" : box.Value?.ToString() ?? "<missing>");
+
+        if (!selection.Exists || selection.Value?.Value is null)
+        {
+            return fallback;
+        }
+
+        return (QuestAlias.Flag?)selection.Value.Value;
+    }
+
+    private IReadOnlyList<object> ResolveNestedStableCollection<TParent>(
+        IReadOnlyList<QuestSnapshot> snapshots,
+        IReadOnlyList<QuestDelta> deltas,
+        QuestDependencyGraph dependencies,
+        string parentKey,
+        Func<QuestSnapshot, KeyedSectionSnapshot<TParent>> parentSelector,
+        Func<TParent, IEnumerable?> collectionSelector,
+        Func<object, string> itemKeyFactory,
+        string componentKind,
+        IReadOnlyDictionary<string, object>? preferredItems = null)
+        where TParent : class
+    {
+        var itemKeys = CollectNestedItemKeys(snapshots, parentKey, parentSelector, collectionSelector, itemKeyFactory);
+        var resolved = new List<(int Order, int SourceOrder, object Item)>();
+
+        foreach (var itemKey in itemKeys)
+        {
+            var timeline = BuildNestedTimeline(snapshots, parentKey, parentSelector, collectionSelector, itemKey, itemKeyFactory);
+            var selection = _scorer.Select(
+                new ComponentKey(componentKind, $"{parentKey}:{itemKey}"),
+                timeline,
+                deltas,
+                dependencies,
+                box => box is null ? "<missing>" : QuestFingerprint.Exact(box.Value));
+
+            if (!selection.Exists || selection.Value?.Value is null)
+            {
+                continue;
+            }
+
+            var chosenItem = preferredItems is not null && preferredItems.TryGetValue(itemKey, out var preferred)
+                ? preferred
+                : selection.Value.Value;
+            resolved.Add((ResolveNestedOrder(timeline), GetLoadOrderIndex(snapshots, selection.SelectedFrom), chosenItem));
+        }
+
+        return resolved
+            .OrderBy(static entry => entry.Order)
+            .ThenByDescending(static entry => entry.SourceOrder)
+            .Select(static entry => entry.Item)
+            .ToArray();
+    }
+
+    private static IReadOnlyDictionary<string, object> BuildLegacyNestedItemMap(
+        IEnumerable? enumerable,
+        Func<object, string> keyFactory)
+    {
+        var items = new Dictionary<string, object>(StringComparer.Ordinal);
+        foreach (var item in EnumerateCollection(enumerable))
+        {
+            items[keyFactory(item)] = item;
+        }
+
+        return items;
+    }
+
+    private static IReadOnlyList<string> CollectNestedItemKeys<TParent>(
+        IReadOnlyList<QuestSnapshot> snapshots,
+        string parentKey,
+        Func<QuestSnapshot, KeyedSectionSnapshot<TParent>> parentSelector,
+        Func<TParent, IEnumerable?> collectionSelector,
+        Func<object, string> itemKeyFactory)
+        where TParent : class
+    {
+        return snapshots
+            .SelectMany(snapshot =>
+            {
+                var section = parentSelector(snapshot);
+                if (!section.Items.TryGetValue(parentKey, out var parent) || parent is null)
+                {
+                    return Enumerable.Empty<string>();
+                }
+
+                return EnumerateCollection(collectionSelector(parent))
+                    .Select(itemKeyFactory);
+            })
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<IntentSupportScorer.ComponentTimelineEntry<NestedItemBox>> BuildNestedTimeline<TParent>(
+        IReadOnlyList<QuestSnapshot> snapshots,
+        string parentKey,
+        Func<QuestSnapshot, KeyedSectionSnapshot<TParent>> parentSelector,
+        Func<TParent, IEnumerable?> collectionSelector,
+        string itemKey,
+        Func<object, string> itemKeyFactory)
+        where TParent : class
+    {
+        return snapshots
+            .Select(snapshot =>
+            {
+                var section = parentSelector(snapshot);
+                if (!section.Items.TryGetValue(parentKey, out var parent) || parent is null)
+                {
+                    return new IntentSupportScorer.ComponentTimelineEntry<NestedItemBox>(
+                        snapshot.Context,
+                        null,
+                        Exists: false,
+                        OrderIndex: null,
+                        ParentExists: false);
+                }
+
+                var collection = collectionSelector(parent);
+                if (collection is null)
+                {
+                    return new IntentSupportScorer.ComponentTimelineEntry<NestedItemBox>(
+                        snapshot.Context,
+                        null,
+                        Exists: false,
+                        OrderIndex: null,
+                        ParentExists: false);
+                }
+
+                var match = EnumerateCollection(collection)
+                    .Select((item, index) => (Item: item, Index: index))
+                    .FirstOrDefault(candidate => StringComparer.Ordinal.Equals(itemKeyFactory(candidate.Item), itemKey));
+
+                return match.Item is null
+                    ? new IntentSupportScorer.ComponentTimelineEntry<NestedItemBox>(
+                        snapshot.Context,
+                        null,
+                        Exists: false,
+                        OrderIndex: null,
+                        ParentExists: true)
+                    : new IntentSupportScorer.ComponentTimelineEntry<NestedItemBox>(
+                        snapshot.Context,
+                        new NestedItemBox(match.Item),
+                        Exists: true,
+                        OrderIndex: match.Index,
+                        ParentExists: true);
+            })
+            .ToArray();
+    }
+
+    private int ResolveNestedOrder(
+        IReadOnlyList<IntentSupportScorer.ComponentTimelineEntry<NestedItemBox>> timeline)
+    {
+        var orderSources = timeline
+            .Select(entry => entry.Exists && entry.OrderIndex.HasValue
+                ? new MergeSource(entry.Context, entry.OrderIndex.Value, Exists: true, ParentExists: entry.ParentExists)
+                : new MergeSource(entry.Context, null, Exists: false, ParentExists: entry.ParentExists))
+            .ToArray();
+
+        var selection = HpmoSelector.Select(
+            orderSources,
+            _officialMasters,
+            static value => Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? "<missing>");
+
+        if (selection?.Value is int order)
+        {
+            return order;
+        }
+
+        return timeline
+            .Where(static entry => entry.OrderIndex.HasValue)
+            .Select(static entry => entry.OrderIndex!.Value)
+            .DefaultIfEmpty(int.MaxValue)
+            .Last();
+    }
+
+    private static int GetLoadOrderIndex(IReadOnlyList<QuestSnapshot> snapshots, Mutagen.Bethesda.Plugins.ModKey modKey)
+    {
+        for (var index = snapshots.Count - 1; index >= 0; index--)
+        {
+            if (snapshots[index].Context.ModKey == modKey)
+            {
+                return snapshots[index].Context.LoadOrderIndex;
+            }
+        }
+
+        return int.MinValue;
+    }
+
+    private static IEnumerable<object> EnumerateCollection(IEnumerable? enumerable)
+    {
+        if (enumerable is null)
+        {
+            yield break;
+        }
+
+        foreach (var item in enumerable)
+        {
+            if (item is not null)
+            {
+                yield return item;
+            }
+        }
     }
 
     private static bool IsDefaultValue(object? value)
@@ -704,6 +1029,62 @@ public sealed class QuestMergePipeline
         return int.MaxValue;
     }
 
+    private static object GetPropertyValue(object? target, string propertyName)
+    {
+        if (target is null)
+        {
+            return "<null>";
+        }
+
+        return target.GetType()
+                   .GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance)
+                   ?.GetValue(target)
+               ?? "<null>";
+    }
+
+    private static string GetFormLinkKey(object item)
+    {
+        return item is Mutagen.Bethesda.Plugins.IFormLinkGetter formLink
+            ? formLink.FormKey.ToString()
+            : Convert.ToString(item, System.Globalization.CultureInfo.InvariantCulture) ?? "<null>";
+    }
+
+    private static string GetContainerItemKey(object item)
+    {
+        return $"{QuestFingerprint.Exact(GetPropertyValue(item, "Item"))}|{QuestFingerprint.Exact(GetPropertyValue(item, "Data"))}";
+    }
+
+    private static string GetNormalizedText(object value)
+    {
+        return Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture)?.Trim() ?? "<null>";
+    }
+
+    private static void ReplaceUntypedListProperty(object target, string propertyName, IReadOnlyList<object> items)
+    {
+        var property = target.GetType().GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance)
+            ?? throw new InvalidOperationException($"Unable to find property {propertyName} on {target.GetType().FullName}.");
+
+        if (items.Count == 0)
+        {
+            property.SetValue(target, null);
+            return;
+        }
+
+        var list = property.GetValue(target) as IList;
+        if (list is null)
+        {
+            list = System.Activator.CreateInstance(property.PropertyType) as IList
+                ?? throw new InvalidOperationException($"Unable to create list for {target.GetType().FullName}.{propertyName}.");
+            property.SetValue(target, list);
+        }
+
+        list.Clear();
+        foreach (var item in items)
+        {
+            list.Add(DeepCopyHelper.DeepCopyObject(item));
+        }
+    }
+
     private void LogConfidenceSummary(string sectionName, IReadOnlyDictionary<MergeConfidence, int> counts)
     {
         if (counts.Count == 0)
@@ -737,6 +1118,16 @@ public sealed class QuestMergePipeline
         }
 
         public IReadOnlyList<QuestScriptFragment> Items { get; }
+    }
+
+    private sealed class NestedItemBox
+    {
+        public NestedItemBox(object value)
+        {
+            Value = value;
+        }
+
+        public object Value { get; }
     }
 
     private static void EnsureListPropertyInitialized(object target, string propertyName)
@@ -782,6 +1173,15 @@ public sealed class QuestMergePipeline
         }
     }
 
+    private static void ReplaceExistingListContents<T>(IList<T> target, IEnumerable<T> source)
+    {
+        target.Clear();
+        foreach (var item in source)
+        {
+            target.Add(item);
+        }
+    }
+
     private static T CloneAs<T>(object item)
     {
         var clone = DeepCopyHelper.DeepCopyObject(item);
@@ -791,5 +1191,24 @@ public sealed class QuestMergePipeline
         }
 
         throw new InvalidOperationException($"Unable to clone {item.GetType().FullName} as {typeof(T).FullName}.");
+    }
+
+    private QuestFragmentAlias ChooseRicherVmadAlias(QuestFragmentAlias? legacyAlias, QuestFragmentAlias selectedAlias)
+    {
+        if (legacyAlias is null)
+        {
+            return DeepCopy(selectedAlias)!;
+        }
+
+        if (!_validator.AreCompatible(legacyAlias, selectedAlias))
+        {
+            return DeepCopy(selectedAlias)!;
+        }
+
+        var legacyPropertyCount = legacyAlias.Scripts?.Sum(static script => script.Properties?.Count ?? 0) ?? 0;
+        var selectedPropertyCount = selectedAlias.Scripts?.Sum(static script => script.Properties?.Count ?? 0) ?? 0;
+        return legacyPropertyCount >= selectedPropertyCount
+            ? DeepCopy(legacyAlias)!
+            : DeepCopy(selectedAlias)!;
     }
 }

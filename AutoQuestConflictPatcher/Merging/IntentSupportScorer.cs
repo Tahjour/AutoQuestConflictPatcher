@@ -65,6 +65,12 @@ public sealed class IntentSupportScorer
                 : entryFingerprint;
             var dependencySupport = HasDependencySupport(key, dependencyGraph, deltas, index);
             var priorFingerprint = previousExistingFingerprint;
+            var dependentAncestorConflict = HasDependentAncestorConflict(
+                timeline,
+                index,
+                deltaKind,
+                candidateFingerprint,
+                fingerprint);
 
             if (entry.Exists && entry.Value is not null)
             {
@@ -140,6 +146,12 @@ public sealed class IntentSupportScorer
             {
                 candidate.BundleSupportCount++;
                 candidate.Score += 2;
+            }
+
+            if (dependentAncestorConflict)
+            {
+                candidate.DependentConflictCount++;
+                candidate.Score += evidence == HpmoEvidenceKind.ExplicitRemoval ? 6 : 4;
             }
 
             if (evidence == HpmoEvidenceKind.StructuralReassertion)
@@ -336,6 +348,11 @@ public sealed class IntentSupportScorer
             reasons.Add($"{candidate.BundleSupportCount} cohesive edit(s)");
         }
 
+        if (candidate.DependentConflictCount > 0)
+        {
+            reasons.Add($"{candidate.DependentConflictCount} dependent override(s)");
+        }
+
         if (candidate.ValidatorPenalty > 0)
         {
             reasons.Add($"validator penalty {candidate.ValidatorPenalty}");
@@ -415,6 +432,52 @@ public sealed class IntentSupportScorer
             }
 
             if (current.Context.Masters.Contains(ancestor.Context.ModKey))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool HasDependentAncestorConflict<T>(
+        IReadOnlyList<ComponentTimelineEntry<T>> timeline,
+        int index,
+        QuestDeltaKind deltaKind,
+        string candidateFingerprint,
+        Func<T?, string> fingerprint)
+        where T : class
+    {
+        if (index <= 0 || deltaKind is QuestDeltaKind.Unchanged)
+        {
+            return false;
+        }
+
+        var current = timeline[index];
+        for (var ancestorIndex = index - 1; ancestorIndex >= 0; ancestorIndex--)
+        {
+            var ancestor = timeline[ancestorIndex];
+            if (!current.Context.Masters.Contains(ancestor.Context.ModKey))
+            {
+                continue;
+            }
+
+            if (deltaKind == QuestDeltaKind.Removed)
+            {
+                if (ancestor.Exists && ancestor.Value is not null)
+                {
+                    return true;
+                }
+
+                continue;
+            }
+
+            if (!ancestor.Exists || ancestor.Value is null)
+            {
+                continue;
+            }
+
+            if (!StringComparer.Ordinal.Equals(fingerprint(ancestor.Value), candidateFingerprint))
             {
                 return true;
             }
@@ -508,6 +571,8 @@ public sealed class IntentSupportScorer
         public int ReassertionCount { get; set; }
 
         public int BundleSupportCount { get; set; }
+
+        public int DependentConflictCount { get; set; }
 
         public int ExplicitRemovalCount { get; set; }
 

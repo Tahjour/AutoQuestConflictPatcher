@@ -23,4 +23,12 @@ public sealed class MergeReport
             File.WriteAllText(path, string.Join(Environment.NewLine, _lines), Encoding.UTF8);
         }
     }
+
+    public IReadOnlyList<string> GetLines()
+    {
+        lock (_gate)
+        {
+            return _lines.ToArray();
+        }
+    }
 }

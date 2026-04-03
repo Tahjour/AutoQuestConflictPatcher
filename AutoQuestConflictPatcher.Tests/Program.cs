@@ -25,6 +25,7 @@ public static class Program
             ("Alias conditions merge per condition and dedupe duplicates", AliasConditionsMergePerConditionAndDedupeDuplicates),
             ("Empty alias keyword lists stay absent", EmptyAliasKeywordListsStayAbsent),
             ("Alias package data keeps HPMO insertion slot when winner omits alias", AliasPackageDataKeepsHpmoInsertionSlotWhenWinnerOmitsAlias),
+            ("Alias conditions keep selected insertion order", AliasConditionsKeepSelectedInsertionOrder),
             ("Aliases keep HPMO slot when later winner omits bucket", AliasesKeepHpmoSlotWhenLaterWinnerOmitsBucket),
             ("Later ITM slot occurrence does not undo earlier meaningful slot", LaterItmSlotOccurrenceDoesNotUndoEarlierMeaningfulSlot),
             ("Remove and readd keeps reintroduced slot order", RemoveAndReaddKeepsReintroducedSlotOrder),
@@ -46,9 +47,16 @@ public static class Program
             ("Stage index metadata survives unrelated later omissions", StageIndexMetadataSurvivesUnrelatedLaterOmissions),
             ("Stage core keeps shared ITM flags and unknown values", StageCoreKeepsSharedItmFlagsAndUnknownValues),
             ("Later sparse stage payload does not zero stage core", LaterSparseStagePayloadDoesNotZeroStageCore),
+            ("Dependent stage core zero override beats inherited ITM", DependentStageCoreZeroOverrideBeatsInheritedItm),
             ("Stage bucket can be removed by a present later stages container", StageBucketCanBeRemovedByPresentLaterStagesContainer),
+            ("Dependent VMAD script property removal beats inherited ITM", DependentVmadScriptPropertyRemovalBeatsInheritedItm),
+            ("Dependent objective replacement beats inherited ITM objective", DependentObjectiveReplacementBeatsInheritedItmObjective),
             ("Mutagen contract exposes quest VMAD alias and stage members", MutagenContractExposesQuestVmadAliasAndStageMembers),
-            ("No-op merge matches winning quest", NoOpMergeMatchesWinningQuest),
+            ("No-op detector matches winning quest", NoOpDetectorMatchesWinningQuest),
+            ("No-op detector treats null and empty alias collections as equal", NoOpDetectorTreatsNullAndEmptyAliasCollectionsAsEqual),
+            ("No-op detector treats null and empty VMAD collections as equal", NoOpDetectorTreatsNullAndEmptyVmadCollectionsAsEqual),
+            ("No-op detector reports semantic changes", NoOpDetectorReportsSemanticChanges),
+            ("No-op detector falls back safely on comparer failures", NoOpDetectorFallsBackSafelyOnComparerFailures),
         };
 
         var failures = 0;
@@ -278,6 +286,40 @@ public static class Program
 
         var merged = Merge(conflict);
         AssertSequenceEqual(new uint[] { 1, 17, 2, 3 }, merged.Aliases!.Select(alias => alias.ID).ToArray(), "Expected the added alias to stay in its HPMO-selected slot instead of moving to the end.");
+    }
+
+    private static void AliasConditionsKeepSelectedInsertionOrder()
+    {
+        var masterCondition = NewCondition(1.0f, CompareOperator.EqualTo);
+        var insertedA = NewCondition(2.0f, CompareOperator.EqualTo);
+        var insertedB = NewCondition(3.0f, CompareOperator.EqualTo);
+
+        var conflict = BuildConflict(
+            Spec("Master.esm", Array.Empty<string>(), quest =>
+            {
+                var alias = NewAlias(18);
+                alias.Conditions!.Add(masterCondition);
+                quest.Aliases!.Add(alias);
+            }),
+            Spec("PatchA.esp", new[] { "Master.esm" }, quest =>
+            {
+                var alias = NewAlias(18);
+                alias.Conditions!.Add(insertedA);
+                alias.Conditions!.Add(insertedB);
+                alias.Conditions!.Add(masterCondition);
+                quest.Aliases!.Add(alias);
+            }),
+            Spec("Winner.esp", new[] { "Master.esm" }, quest =>
+            {
+                var alias = NewAlias(18);
+                alias.Conditions!.Add(masterCondition);
+                quest.Aliases!.Add(alias);
+            }));
+
+        var merged = Merge(conflict);
+        var alias = merged.Aliases!.Single(candidate => candidate.ID == 18);
+        var values = alias.Conditions!.Cast<ConditionFloat>().Select(static condition => condition.ComparisonValue).ToArray();
+        AssertSequenceEqual(new[] { 2.0f, 3.0f, 1.0f }, values, "Expected alias conditions to keep the inserted order anchor instead of falling back to legacy/winner order.");
     }
 
     private static void LaterItmSlotOccurrenceDoesNotUndoEarlierMeaningfulSlot()
@@ -917,6 +959,111 @@ public static class Program
         AssertEqual((ushort)52, merged.Stages![0].Index, "Expected the remaining stage bucket to be the one still present in the later stages container.");
     }
 
+    private static void DependentStageCoreZeroOverrideBeatsInheritedItm()
+    {
+        var conflict = BuildConflict(
+            Spec("Skyrim.esm", Array.Empty<string>(), quest =>
+            {
+                quest.Stages!.Add(new QuestStage
+                {
+                    Index = 49,
+                    Unknown = 49,
+                    LogEntries = [],
+                });
+            }),
+            Spec("USSEP.esp", new[] { "Skyrim.esm" }, quest =>
+            {
+                quest.Stages!.Add(new QuestStage
+                {
+                    Index = 49,
+                    Unknown = 49,
+                    LogEntries = [],
+                });
+            }),
+            Spec("BOTI.esp", new[] { "Skyrim.esm", "USSEP.esp" }, quest =>
+            {
+                quest.Stages!.Add(new QuestStage
+                {
+                    Index = 49,
+                    Unknown = 0,
+                    LogEntries = [],
+                });
+            }));
+
+        var merged = Merge(conflict);
+        var stage = merged.Stages!.Single();
+        AssertEqual((byte)0, stage.Unknown, "Expected an explicit later dependent zero override to beat inherited ITM carry-forward.");
+    }
+
+    private static void DependentVmadScriptPropertyRemovalBeatsInheritedItm()
+    {
+        var conflict = BuildConflict(
+            Spec("Update.esm", Array.Empty<string>(), quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                var script = NewScript("QF_MS11_0001F7A3");
+                script.Properties!.Add(new ScriptObjectProperty { Name = "Keep", Object = Link<IQuestGetter>("123456:Master.esm"), Alias = 1 });
+                script.Properties!.Add(new ScriptObjectProperty { Name = "RemoveMe", Object = Link<IQuestGetter>("123456:Master.esm"), Alias = 2 });
+                quest.VirtualMachineAdapter!.Scripts!.Add(script);
+            }),
+            Spec("USSEP.esp", new[] { "Update.esm" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                var script = NewScript("QF_MS11_0001F7A3");
+                script.Properties!.Add(new ScriptObjectProperty { Name = "Keep", Object = Link<IQuestGetter>("123456:Master.esm"), Alias = 1 });
+                script.Properties!.Add(new ScriptObjectProperty { Name = "RemoveMe", Object = Link<IQuestGetter>("123456:Master.esm"), Alias = 2 });
+                quest.VirtualMachineAdapter!.Scripts!.Add(script);
+            }),
+            Spec("BOTI.esp", new[] { "Update.esm", "USSEP.esp" }, quest =>
+            {
+                quest.VirtualMachineAdapter = NewQuestAdapter();
+                var script = NewScript("QF_MS11_0001F7A3");
+                script.Properties!.Add(new ScriptObjectProperty { Name = "Keep", Object = Link<IQuestGetter>("123456:Master.esm"), Alias = 1 });
+                quest.VirtualMachineAdapter!.Scripts!.Add(script);
+            }));
+
+        var merged = Merge(conflict);
+        var script = merged.VirtualMachineAdapter!.Scripts!.Single();
+        var propertyNames = script.Properties!.Select(static property => property.Name).ToArray();
+        AssertSequenceEqual(new[] { "Keep" }, propertyNames, "Expected a later dependent script to be able to remove inherited ITM properties.");
+    }
+
+    private static void DependentObjectiveReplacementBeatsInheritedItmObjective()
+    {
+        var conflict = BuildConflict(
+            Spec("Update.esm", Array.Empty<string>(), quest =>
+            {
+                quest.Objectives!.Add(new QuestObjective
+                {
+                    Index = 10,
+                    DisplayText = "Question the witnesses",
+                    Targets = [],
+                });
+            }),
+            Spec("USSEP.esp", new[] { "Update.esm" }, quest =>
+            {
+                quest.Objectives!.Add(new QuestObjective
+                {
+                    Index = 10,
+                    DisplayText = "Question the witnesses",
+                    Targets = [],
+                });
+            }),
+            Spec("BOTI.esp", new[] { "Update.esm", "USSEP.esp" }, quest =>
+            {
+                quest.Objectives!.Add(new QuestObjective
+                {
+                    Index = 15,
+                    DisplayText = "Get assistance from <Alias=AuthorityFigure>",
+                    Targets = [],
+                });
+            }));
+
+        var merged = Merge(conflict);
+        var objectiveIndices = merged.Objectives!.Select(static objective => objective.Index).ToArray();
+        AssertSequenceEqual(new ushort[] { 15 }, objectiveIndices, "Expected a later dependent replacement objective to beat inherited ITM objective carry-forward.");
+    }
+
     private static void MutagenContractExposesQuestVmadAliasAndStageMembers()
     {
         AssertTrue(typeof(QuestAdapter).GetProperty(nameof(QuestAdapter.Aliases)) is not null, "Expected Mutagen QuestAdapter to expose the Aliases property.");
@@ -927,14 +1074,110 @@ public static class Program
         AssertTrue(typeof(QuestStage).GetProperty(nameof(QuestStage.Unknown)) is not null, "Expected Mutagen QuestStage to expose the Unknown field.");
     }
 
-    private static void NoOpMergeMatchesWinningQuest()
+    private static void NoOpDetectorMatchesWinningQuest()
     {
         var conflict = BuildConflict(
             Spec("Master.esm", Array.Empty<string>(), quest => { quest.Priority = 10; }),
             Spec("PatchA.esp", new[] { "Master.esm" }, quest => { quest.Priority = 10; }));
 
         var merged = Merge(conflict);
-        AssertTrue(merged.Equals(conflict.WinningQuest), "Expected an identical override to stay unchanged after merging.");
+        var report = new MergeReport();
+        var detector = new QuestNoOpDetector(report);
+        AssertTrue(detector.IsSemanticallyEqual(merged, conflict.WinningQuest), "Expected an identical override to stay unchanged after merging.");
+    }
+
+    private static void NoOpDetectorTreatsNullAndEmptyAliasCollectionsAsEqual()
+    {
+        var left = NewQuest(FormKey.Factory("123456:Master.esm"));
+        var right = NewQuest(FormKey.Factory("123456:Master.esm"));
+
+        left.Aliases!.Add(new QuestAlias
+        {
+            ID = 1,
+            Name = "Alias1",
+            Conditions = null!,
+            Keywords = null!,
+            Factions = null!,
+            Items = null!,
+            PackageData = null!,
+            Spells = null!,
+        });
+
+        right.Aliases!.Add(new QuestAlias
+        {
+            ID = 1,
+            Name = "Alias1",
+            Conditions = [],
+            Keywords = [],
+            Factions = [],
+            Items = [],
+            PackageData = [],
+            Spells = [],
+        });
+
+        var report = new MergeReport();
+        var detector = new QuestNoOpDetector(report);
+        AssertTrue(
+            detector.IsSemanticallyEqual(left, right),
+            $"Expected null and empty nested alias collections to compare equal. Report: {string.Join(" || ", report.GetLines())}");
+    }
+
+    private static void NoOpDetectorTreatsNullAndEmptyVmadCollectionsAsEqual()
+    {
+        var left = NewQuest(FormKey.Factory("123456:Master.esm"));
+        var right = NewQuest(FormKey.Factory("123456:Master.esm"));
+        left.VirtualMachineAdapter = NewQuestAdapter();
+        right.VirtualMachineAdapter = NewQuestAdapter();
+
+        left.VirtualMachineAdapter!.Aliases!.Add(new QuestFragmentAlias
+        {
+            Property = new ScriptObjectProperty
+            {
+                Name = "AliasBinding",
+                Object = Link<IQuestGetter>("123456:Master.esm"),
+                Alias = 1,
+            },
+            Scripts = null!,
+        });
+
+        right.VirtualMachineAdapter!.Aliases!.Add(new QuestFragmentAlias
+        {
+            Property = new ScriptObjectProperty
+            {
+                Name = "AliasBinding",
+                Object = Link<IQuestGetter>("123456:Master.esm"),
+                Alias = 1,
+            },
+            Scripts = [],
+        });
+
+        var report = new MergeReport();
+        var detector = new QuestNoOpDetector(report);
+        AssertTrue(
+            detector.IsSemanticallyEqual(left, right),
+            $"Expected null and empty VMAD nested collections to compare equal. Report: {string.Join(" || ", report.GetLines())}");
+    }
+
+    private static void NoOpDetectorReportsSemanticChanges()
+    {
+        var left = NewQuest(FormKey.Factory("123456:Master.esm"));
+        var right = NewQuest(FormKey.Factory("123456:Master.esm"));
+        left.Priority = 10;
+        right.Priority = 20;
+
+        var detector = new QuestNoOpDetector(new MergeReport());
+        AssertTrue(!detector.IsSemanticallyEqual(left, right), "Expected a real semantic change to be detected.");
+    }
+
+    private static void NoOpDetectorFallsBackSafelyOnComparerFailures()
+    {
+        var left = NewQuest(FormKey.Factory("123456:Master.esm"));
+        var right = NewQuest(FormKey.Factory("123456:Master.esm"));
+        var report = new MergeReport();
+        var detector = new QuestNoOpDetector(report, leafFingerprint: _ => throw new InvalidOperationException("boom"));
+
+        AssertTrue(!detector.IsSemanticallyEqual(left, right, "Q_Test"), "Expected comparator failures to fall back to 'changed' instead of throwing.");
+        AssertTrue(report.GetLines().Any(static line => line.Contains("Null-safe no-op comparison failed", StringComparison.Ordinal)), "Expected comparator failure to be logged to the merge report.");
     }
 
     private static QuestConflict BuildConflict(params ConflictSpec[] specs)
